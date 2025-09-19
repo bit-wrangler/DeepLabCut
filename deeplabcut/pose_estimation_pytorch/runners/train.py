@@ -19,6 +19,7 @@ from typing import Any, Generic
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DataParallel
 from torch.utils.data import DataLoader
 
@@ -38,6 +39,543 @@ from deeplabcut.pose_estimation_pytorch.runners.logger import (
 )
 from deeplabcut.pose_estimation_pytorch.runners.snapshots import TorchSnapshotManager
 from deeplabcut.pose_estimation_pytorch.task import Task
+
+
+def apply_skeletal_target_masking(
+    target: dict,
+    batch_annotations: dict,
+    skeletal_data: dict,
+    bodyparts: list[str],
+    device: torch.device,
+    stride: float = 4.0,  # Default stride for ResNet-based models
+    skeletal_radius_multiplier: float = 1.0,
+    union_intersect_adjacent_skeletal_mask_alpha: float = 0.5
+) -> dict:
+    """
+    Apply skeletal-aware masking to target heatmaps based on anatomical limb lengths.
+
+    For limb landmarks (elbows, wrists, knees, ankles), creates circular masks around
+    adjacent landmarks with radius equal to the expected limb length. The masks from
+    adjacent landmarks are combined and then multiplied with the target heatmap.
+
+    Args:
+        target: Target dictionary containing heatmap targets
+        batch_annotations: Batch annotations containing keypoint positions
+        skeletal_data: Dict containing 'links' and 'link_lengths' arrays
+        bodyparts: List of bodypart names to get indices
+        device: Device to put tensors on
+        stride: Model stride for coordinate conversion
+        skeletal_radius_multiplier: Multiplier for limb length radii
+        union_intersect_adjacent_skeletal_mask_alpha: Interpolation factor between
+                                                    union (0.0) and intersection (1.0).
+                                                    0.0 = pure union (OR), 1.0 = pure intersection (AND)
+
+    Returns:
+        Modified target dictionary with masked heatmaps
+    """
+    if not skeletal_data or len(skeletal_data.get('links', [])) == 0:
+        return target  # Return unmodified if no skeletal data
+
+    if "bodypart" not in target or "heatmap" not in target["bodypart"] or "target" not in target["bodypart"]["heatmap"]:
+        return target  # Return unmodified if target structure is unexpected
+
+    heatmap_targets = target["bodypart"]["heatmap"]["target"]  # Shape: (batch, height, width, num_joints)
+    batch_size, height, width, num_joints = heatmap_targets.shape
+
+    # Define limb landmarks and their adjacent landmarks
+    limb_landmark_mapping = {
+        'left_elbow': ['left_shoulder', 'left_wrist'],
+        'right_elbow': ['right_shoulder', 'right_wrist'],
+        'left_wrist': ['left_elbow'],
+        'right_wrist': ['right_elbow'],
+        'left_knee': ['left_hip', 'left_ankle'],
+        'right_knee': ['right_hip', 'right_ankle'],
+        'left_ankle': ['left_knee'],
+        'right_ankle': ['right_knee']
+    }
+
+    # Create mapping from limb names to expected lengths
+    limb_length_mapping = {
+        ('left_shoulder', 'left_elbow'): 'upper.forelimb',
+        ('right_shoulder', 'right_elbow'): 'upper.forelimb',
+        ('left_elbow', 'left_wrist'): 'lower.forelimb',
+        ('right_elbow', 'right_wrist'): 'lower.forelimb',
+        ('left_hip', 'left_knee'): 'upper.hindlimb',
+        ('right_hip', 'right_knee'): 'upper.hindlimb',
+        ('left_knee', 'left_ankle'): 'lower.hindlimb',
+        ('right_knee', 'right_ankle'): 'lower.hindlimb'
+    }
+
+    # Process each sample in the batch
+    for batch_idx in range(batch_size):
+        # Get skeletal data for this sample
+        if isinstance(skeletal_data['links'], (list, np.ndarray)) and len(skeletal_data['links']) > batch_idx:
+            sample_links = skeletal_data['links'][batch_idx]
+            sample_lengths = skeletal_data['link_lengths'][batch_idx]
+        else:
+            continue  # Skip if no skeletal data for this sample
+
+        if len(sample_links) == 0:
+            continue  # Skip if no links
+
+        # Get keypoint annotations for this sample
+        if batch_idx >= len(batch_annotations['keypoints']):
+            continue  # Skip if no annotations for this sample
+
+        keypoints = batch_annotations['keypoints'][batch_idx]  # Shape: (num_animals, num_joints, 3)
+        if len(keypoints) == 0:
+            continue  # Skip if no keypoints
+
+        # Use first animal (assuming single animal)
+        animal_keypoints = keypoints[0]  # Shape: (num_joints, 3)
+
+        # Create length lookup from skeletal data
+        length_lookup = {}
+        for link_idx, link in enumerate(sample_links):
+            if link_idx >= len(sample_lengths):
+                continue
+
+            # Handle different tensor/list formats
+            if isinstance(link, torch.Tensor):
+                if link.dim() == 0:
+                    continue
+                elif link.dim() == 1 and len(link) >= 2:
+                    bp1_idx, bp2_idx = link[0].item(), link[1].item()
+                else:
+                    continue
+            elif isinstance(link, (list, tuple)) and len(link) >= 2:
+                bp1_idx, bp2_idx = link[0], link[1]
+            else:
+                continue
+
+            # Get expected length
+            expected_length = sample_lengths[link_idx]
+            if isinstance(expected_length, torch.Tensor):
+                if expected_length.dim() == 0:
+                    expected_length = expected_length.item()
+                else:
+                    continue
+
+            if expected_length <= 0:
+                continue
+
+            # Store length for both directions
+            if bp1_idx < len(bodyparts) and bp2_idx < len(bodyparts):
+                bp1_name = bodyparts[bp1_idx]
+                bp2_name = bodyparts[bp2_idx]
+                length_lookup[(bp1_name, bp2_name)] = expected_length
+                length_lookup[(bp2_name, bp1_name)] = expected_length
+
+        # Apply masking to each limb landmark
+        for limb_name, adjacent_landmarks in limb_landmark_mapping.items():
+            if limb_name not in bodyparts:
+                continue
+
+            limb_idx = bodyparts.index(limb_name)
+
+            # Collect all circular masks for interpolation
+            circular_masks = []
+            mask_applied = False
+
+            # Add circular masks from each adjacent landmark
+            for adj_name in adjacent_landmarks:
+                if adj_name not in bodyparts:
+                    continue
+
+                adj_idx = bodyparts.index(adj_name)
+
+                # Check if keypoint is visible
+                if animal_keypoints[adj_idx, 2] < 0.5:  # visibility threshold
+                    continue
+
+                # Get expected limb length
+                limb_key = (adj_name, limb_name)
+                if limb_key not in length_lookup:
+                    continue
+
+                expected_length = length_lookup[limb_key]
+
+                # Get adjacent landmark position (in image coordinates)
+                adj_x = animal_keypoints[adj_idx, 0].item()
+                adj_y = animal_keypoints[adj_idx, 1].item()
+
+                # Convert to heatmap coordinates using stride
+                # Heatmap coordinates = image_coordinates / stride
+                heatmap_x = adj_x / stride
+                heatmap_y = adj_y / stride
+
+                # Calculate radius in heatmap coordinates
+                # Scale the expected length (in image coordinates) to heatmap coordinates
+                radius = expected_length / stride * skeletal_radius_multiplier
+
+                # Create circular mask
+                y_coords, x_coords = torch.meshgrid(
+                    torch.arange(height, device=device),
+                    torch.arange(width, device=device),
+                    indexing='ij'
+                )
+
+                # Calculate distance from adjacent landmark
+                distances = torch.sqrt((x_coords - heatmap_x) ** 2 + (y_coords - heatmap_y) ** 2)
+
+                # Create circular mask (1 inside circle, 0 outside)
+                circle_mask = (distances <= radius).float()
+
+                # Collect mask for interpolation
+                circular_masks.append(circle_mask)
+                mask_applied = True
+
+            # Apply mask to target heatmap
+            if mask_applied and len(circular_masks) > 0:
+                # Interpolate between union and intersection
+                if len(circular_masks) == 1:
+                    # Single mask - no interpolation needed
+                    mask = circular_masks[0]
+                else:
+                    # Multiple masks - interpolate between union and intersection
+                    # Stack masks for efficient computation
+                    stacked_masks = torch.stack(circular_masks, dim=0)  # Shape: (num_masks, height, width)
+
+                    # Compute union (maximum across masks)
+                    union_mask = torch.max(stacked_masks, dim=0)[0]
+
+                    # Compute intersection (minimum across masks)
+                    intersection_mask = torch.min(stacked_masks, dim=0)[0]
+
+                    # Interpolate: mask = (1 - alpha) * union + alpha * intersection
+                    alpha = union_intersect_adjacent_skeletal_mask_alpha
+                    mask = (1.0 - alpha) * union_mask + alpha * intersection_mask
+
+                # Multiply target heatmap by mask
+                heatmap_targets[batch_idx, :, :, limb_idx] *= mask
+            # If no mask was applied, leave target unchanged (equivalent to mask of all 1's)
+
+    return target
+
+
+def apply_skeletal_target_masking_simple(
+    target: dict,
+    batch_annotations: dict,
+    bodyparts: list[str],
+    device: torch.device,
+    stride: float = 4.0,  # Default stride for ResNet-based models
+    skeletal_radius_multiplier: float = 1.0,
+    union_intersect_adjacent_skeletal_mask_alpha: float = 0.5
+) -> dict:
+    """
+    Apply skeletal-aware masking to target heatmaps using GT landmark distances.
+
+    Similar to apply_skeletal_target_masking but estimates limb lengths dynamically
+    from GT landmark coordinates instead of using reference skeletal data.
+
+    For limb landmarks (elbows, wrists, knees, ankles), creates circular masks around
+    adjacent landmarks with radius equal to the actual distance between GT landmarks.
+    The masks from adjacent landmarks are combined and then multiplied with the target heatmap.
+
+    Args:
+        target: Target dictionary containing heatmap targets
+        batch_annotations: Batch annotations containing keypoint positions
+        bodyparts: List of bodypart names to get indices
+        device: Device to put tensors on
+        stride: Model stride for coordinate conversion
+        skeletal_radius_multiplier: Multiplier for limb length radii
+        union_intersect_adjacent_skeletal_mask_alpha: Interpolation factor between
+                                                    union (0.0) and intersection (1.0).
+                                                    0.0 = pure union (OR), 1.0 = pure intersection (AND)
+
+    Returns:
+        Modified target dictionary with masked heatmaps
+    """
+    if "bodypart" not in target or "heatmap" not in target["bodypart"] or "target" not in target["bodypart"]["heatmap"]:
+        return target  # Return unmodified if target structure is unexpected
+
+    heatmap_targets = target["bodypart"]["heatmap"]["target"]  # Shape: (batch, height, width, num_joints)
+    batch_size, height, width, num_joints = heatmap_targets.shape
+
+    # Define limb landmarks and their adjacent landmarks (same as original function)
+    limb_landmark_mapping = {
+        'left_elbow': ['left_shoulder', 'left_wrist'],
+        'right_elbow': ['right_shoulder', 'right_wrist'],
+        'left_wrist': ['left_elbow'],
+        'right_wrist': ['right_elbow'],
+        'left_knee': ['left_hip', 'left_ankle'],
+        'right_knee': ['right_hip', 'right_ankle'],
+        'left_ankle': ['left_knee'],
+        'right_ankle': ['right_knee']
+    }
+
+    # Process each sample in the batch
+    for batch_idx in range(batch_size):
+        # Get keypoint annotations for this sample
+        if batch_idx >= len(batch_annotations['keypoints']):
+            continue  # Skip if no annotations for this sample
+
+        keypoints = batch_annotations['keypoints'][batch_idx]  # Shape: (num_animals, num_joints, 3)
+        if len(keypoints) == 0:
+            continue  # Skip if no keypoints
+
+        # Use first animal (assuming single animal)
+        animal_keypoints = keypoints[0]  # Shape: (num_joints, 3)
+
+        # Apply masking to each limb landmark
+        for limb_name, adjacent_landmarks in limb_landmark_mapping.items():
+            if limb_name not in bodyparts:
+                continue
+
+            limb_idx = bodyparts.index(limb_name)
+
+            # Check if limb landmark is visible
+            if animal_keypoints[limb_idx, 2] < 0.5:  # visibility threshold
+                continue
+
+            # Get limb landmark position
+            limb_x = animal_keypoints[limb_idx, 0].item()
+            limb_y = animal_keypoints[limb_idx, 1].item()
+
+            # Collect all circular masks for interpolation
+            circular_masks = []
+            mask_applied = False
+
+            # Add circular masks from each adjacent landmark
+            for adj_name in adjacent_landmarks:
+                if adj_name not in bodyparts:
+                    continue
+
+                adj_idx = bodyparts.index(adj_name)
+
+                # Check if adjacent keypoint is visible
+                if animal_keypoints[adj_idx, 2] < 0.5:  # visibility threshold
+                    continue
+
+                # Get adjacent landmark position (in image coordinates)
+                adj_x = animal_keypoints[adj_idx, 0].item()
+                adj_y = animal_keypoints[adj_idx, 1].item()
+
+                # Calculate actual distance between limb and adjacent landmark (GT limb length)
+                gt_limb_length = ((limb_x - adj_x) ** 2 + (limb_y - adj_y) ** 2) ** 0.5
+
+                # Skip if landmarks are too close (likely annotation error)
+                if gt_limb_length < 1.0:  # minimum 1 pixel distance
+                    continue
+
+                # Convert adjacent landmark to heatmap coordinates using stride
+                heatmap_x = adj_x / stride
+                heatmap_y = adj_y / stride
+
+                # Calculate radius in heatmap coordinates using GT limb length
+                radius = gt_limb_length / stride * skeletal_radius_multiplier
+
+                # Create circular mask
+                y_coords, x_coords = torch.meshgrid(
+                    torch.arange(height, device=device),
+                    torch.arange(width, device=device),
+                    indexing='ij'
+                )
+
+                # Calculate distance from adjacent landmark
+                distances = torch.sqrt((x_coords - heatmap_x) ** 2 + (y_coords - heatmap_y) ** 2)
+
+                # Create circular mask (1 inside circle, 0 outside)
+                circle_mask = (distances <= radius).float()
+
+                # Collect mask for interpolation
+                circular_masks.append(circle_mask)
+                mask_applied = True
+
+            # Apply mask to target heatmap
+            if mask_applied and len(circular_masks) > 0:
+                # Interpolate between union and intersection
+                if len(circular_masks) == 1:
+                    # Single mask - no interpolation needed
+                    mask = circular_masks[0]
+                else:
+                    # Multiple masks - interpolate between union and intersection
+                    # Stack masks for efficient computation
+                    stacked_masks = torch.stack(circular_masks, dim=0)  # Shape: (num_masks, height, width)
+
+                    # Compute union (maximum across masks)
+                    union_mask = torch.max(stacked_masks, dim=0)[0]
+
+                    # Compute intersection (minimum across masks)
+                    intersection_mask = torch.min(stacked_masks, dim=0)[0]
+
+                    # Interpolate: mask = (1 - alpha) * union + alpha * intersection
+                    alpha = union_intersect_adjacent_skeletal_mask_alpha
+                    mask = (1.0 - alpha) * union_mask + alpha * intersection_mask
+
+                # Multiply target heatmap by mask
+                heatmap_targets[batch_idx, :, :, limb_idx] *= mask
+            # If no mask was applied, leave target unchanged (equivalent to mask of all 1's)
+
+    return target
+
+
+def compute_skeletal_constraint_loss(
+    predicted_keypoints: torch.Tensor,
+    skeletal_data: dict,
+    bodyparts: list[str],
+    device: torch.device,
+    loss_weight: float = 1.0
+) -> torch.Tensor:
+    """
+    Compute skeletal constraint loss based on expected limb lengths.
+
+    Args:
+        predicted_keypoints: Tensor of shape (batch_size, num_animals, num_joints, 3)
+                           where last dim is [x, y, visibility]
+        skeletal_data: Dict containing 'links' and 'link_lengths' arrays
+        bodyparts: List of bodypart names to get indices
+        device: Device to put tensors on
+        loss_weight: Weight for the skeletal loss
+
+    Returns:
+        Skeletal constraint loss tensor
+    """
+    if not skeletal_data or len(skeletal_data.get('links', [])) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    batch_size = predicted_keypoints.shape[0]
+    sample_losses = []
+
+    # Get indices for snout and tail1 for normalization
+    try:
+        snout_idx = bodyparts.index('snout')
+        tail1_idx = bodyparts.index('tail1')
+    except ValueError:
+        # If snout or tail1 not in bodyparts, return zero loss
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    for batch_idx in range(batch_size):
+        # Get skeletal data for this sample
+        if isinstance(skeletal_data['links'], torch.Tensor):
+            # If it's already a tensor, assume it's the same for all samples in batch
+            links = skeletal_data['links']
+            link_lengths = skeletal_data['link_lengths']
+        elif isinstance(skeletal_data['links'], (list, np.ndarray)):
+            # If it's a list/array, get the data for this batch index
+            if len(skeletal_data['links']) > batch_idx:
+                links = skeletal_data['links'][batch_idx]
+                link_lengths = skeletal_data['link_lengths'][batch_idx]
+            else:
+                # Use the same data for all samples (broadcast)
+                links = skeletal_data['links'][0] if len(skeletal_data['links']) > 0 else []
+                link_lengths = skeletal_data['link_lengths'][0] if len(skeletal_data['link_lengths']) > 0 else []
+        else:
+            links = skeletal_data['links']
+            link_lengths = skeletal_data['link_lengths']
+
+        if len(links) == 0:
+            continue
+
+        # Convert to tensors if needed
+        if not isinstance(links, torch.Tensor):
+            links = torch.tensor(links, device=device, dtype=torch.long)
+        if not isinstance(link_lengths, torch.Tensor):
+            link_lengths = torch.tensor(link_lengths, device=device, dtype=torch.float32)
+
+        # Get keypoints for this sample (assuming single animal for now)
+        kpts = predicted_keypoints[batch_idx, 0]  # Shape: (num_joints, 3)
+
+        # Check if snout and tail1 are visible and valid for normalization
+        snout_vis = kpts[snout_idx, 2] > 0.5  # visibility threshold
+        tail1_vis = kpts[tail1_idx, 2] > 0.5
+
+        if not (snout_vis and tail1_vis):
+            # Cannot normalize, skip this sample
+            continue
+
+        # Compute normalization factor (snout to tail1 distance)
+        snout_pos = kpts[snout_idx, :2]  # [x, y]
+        tail1_pos = kpts[tail1_idx, :2]  # [x, y]
+        svl_distance = torch.norm(snout_pos - tail1_pos)
+
+        if svl_distance < 1e-6:  # Avoid division by zero
+            continue
+
+        link_losses = []
+
+        for link_idx in range(len(links)):
+            # Check bounds for both links and link_lengths
+            if link_idx >= len(link_lengths):
+                continue  # Skip if no corresponding length data
+
+            link = links[link_idx]
+            expected_length = link_lengths[link_idx]
+
+            # Handle different tensor/list formats
+            if isinstance(link, torch.Tensor):
+                if link.dim() == 0:  # 0-d tensor (scalar)
+                    continue  # Skip invalid links
+                elif link.dim() == 1 and len(link) >= 2:
+                    bp1_idx, bp2_idx = link[0].item(), link[1].item()
+                else:
+                    continue  # Skip invalid links
+            elif isinstance(link, (list, tuple)) and len(link) >= 2:
+                bp1_idx, bp2_idx = link[0], link[1]
+            else:
+                continue  # Skip invalid links
+
+            # Handle expected_length format
+            if isinstance(expected_length, torch.Tensor):
+                if expected_length.dim() == 0:
+                    expected_length = expected_length.item()
+                else:
+                    continue  # Skip invalid expected lengths
+
+            # Skip if expected length is NaN or invalid
+            if torch.isnan(torch.tensor(expected_length)) or expected_length <= 0:
+                continue
+
+            # Check if both keypoints are visible
+            bp1_vis = kpts[bp1_idx, 2] > 0.5
+            bp2_vis = kpts[bp2_idx, 2] > 0.5
+
+            if not (bp1_vis and bp2_vis):
+                continue
+
+            # Compute predicted distance
+            bp1_pos = kpts[bp1_idx, :2]
+            bp2_pos = kpts[bp2_idx, :2]
+            predicted_distance = torch.norm(bp1_pos - bp2_pos)
+
+            # Normalize both distances by predicted SVL to make them scale-invariant
+            normalized_predicted = predicted_distance / svl_distance
+
+            # For the expected length, we need to normalize it by the expected SVL
+            # to get the relative proportion, then we can compare with the predicted proportion
+            expected_svl_length = None
+
+            # Try to find SVL link in the current links to get expected SVL
+            for svl_idx in range(len(links)):
+                svl_bp1, svl_bp2 = links[svl_idx]
+                if (svl_bp1 == snout_idx and svl_bp2 == tail1_idx) or (svl_bp1 == tail1_idx and svl_bp2 == snout_idx):
+                    expected_svl_length = link_lengths[svl_idx]
+                    break
+
+            if expected_svl_length is not None and expected_svl_length > 0:
+                # Normalize expected length by expected SVL to get relative proportion
+                normalized_expected = expected_length / expected_svl_length
+            else:
+                # If we can't find expected SVL, skip this constraint
+                continue
+
+            # Compute constraint loss: 0 if pred <= expected, (pred - expected)^2 if pred > expected
+            diff = normalized_predicted - normalized_expected
+            link_loss = torch.where(diff > 0, diff ** 2, torch.tensor(0.0, device=device))
+            link_losses.append(link_loss)
+
+        if len(link_losses) > 0:
+            # Stack and average the losses to avoid in-place operations
+            sample_loss = torch.stack(link_losses).mean()
+            sample_losses.append(sample_loss)
+
+    if len(sample_losses) > 0:
+        # Stack and average all sample losses to avoid in-place operations
+        total_loss = torch.stack(sample_losses).mean() * loss_weight
+    else:
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+    return total_loss
 
 
 class TrainingRunner(Runner, Generic[ModelType], metaclass=ABCMeta):
@@ -91,6 +629,7 @@ class TrainingRunner(Runner, Generic[ModelType], metaclass=ABCMeta):
         logger: BaseLogger | None = None,
         log_filename: str = "learning_stats.csv",
         load_weights_only: bool | None = None,
+        model_cfg: dict | None = None,
     ):
         super().__init__(
             model=model, device=device, gpus=gpus, snapshot_path=snapshot_path
@@ -104,6 +643,7 @@ class TrainingRunner(Runner, Generic[ModelType], metaclass=ABCMeta):
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.snapshot_manager = snapshot_manager
+        self.model_cfg = model_cfg or {}
         self.history: dict[str, list] = dict(train_loss=[], eval_loss=[])
         self.csv_logger = CSVLogger(
             train_folder=snapshot_manager.model_folder,
@@ -208,6 +748,52 @@ class TrainingRunner(Runner, Generic[ModelType], metaclass=ABCMeta):
         if self.starting_epoch > 0:
             epochs = self.starting_epoch + epochs
 
+        self.union_intersect_adjacent_skeletal_mask_alpha_start = 0.0
+        if "union_intersect_adjacent_skeletal_mask_alpha_start" in self.model_cfg:
+            self.union_intersect_adjacent_skeletal_mask_alpha_start = self.model_cfg[
+                "union_intersect_adjacent_skeletal_mask_alpha_start"
+            ]
+        self.union_intersect_adjacent_skeletal_mask_alpha_end = 1.0
+        if "union_intersect_adjacent_skeletal_mask_alpha_end" in self.model_cfg:
+            self.union_intersect_adjacent_skeletal_mask_alpha_end = self.model_cfg[
+                "union_intersect_adjacent_skeletal_mask_alpha_end"
+            ]
+
+        self.skeletal_radius_multiplier_start = 1.1
+        if "skeletal_radius_multiplier_start" in self.model_cfg:
+            self.skeletal_radius_multiplier_start = self.model_cfg[
+                "skeletal_radius_multiplier_start"
+            ]
+        self.skeletal_radius_multiplier_end = 1.1
+        if "skeletal_radius_multiplier_end" in self.model_cfg:
+            self.skeletal_radius_multiplier_end = self.model_cfg[
+                "skeletal_radius_multiplier_end"
+            ]
+
+        self.truncate_targets = False
+        if "truncate_targets" in self.model_cfg:
+            self.truncate_targets = self.model_cfg["truncate_targets"]
+
+        self.union_intersect_adjacent_skeletal_mask_alpha = self.union_intersect_adjacent_skeletal_mask_alpha_start
+        self.skeletal_radius_multiplier = self.skeletal_radius_multiplier_start
+
+        union_intersect_adjacent_skeletal_mask_start_epoch = 50
+        if "union_intersect_adjacent_skeletal_mask_start_epoch" in self.model_cfg:
+            union_intersect_adjacent_skeletal_mask_start_epoch = self.model_cfg[
+                "union_intersect_adjacent_skeletal_mask_start_epoch"
+            ]
+        union_intersect_adjacent_skeletal_mask_end_epoch = 150
+        if "union_intersect_adjacent_skeletal_mask_end_epoch" in self.model_cfg:
+            union_intersect_adjacent_skeletal_mask_end_epoch = self.model_cfg[
+                "union_intersect_adjacent_skeletal_mask_end_epoch"
+            ]
+
+        n_union_intersection_steps = union_intersect_adjacent_skeletal_mask_end_epoch - union_intersect_adjacent_skeletal_mask_start_epoch
+
+        self.use_skeletal_reference = False
+        if "use_skeletal_reference" in self.model_cfg:
+            self.use_skeletal_reference = self.model_cfg["use_skeletal_reference"]
+
         for e in range(self.starting_epoch + 1, epochs + 1):
             self.current_epoch = e
             self._metadata["epoch"] = e
@@ -216,6 +802,19 @@ class TrainingRunner(Runner, Generic[ModelType], metaclass=ABCMeta):
             )
             if self.scheduler:
                 self.scheduler.step()
+
+            # Interpolate between union and intersection
+            if e < epochs:
+                t = (e - union_intersect_adjacent_skeletal_mask_start_epoch) / n_union_intersection_steps
+                t = np.clip(t, 0, 1)
+                self.union_intersect_adjacent_skeletal_mask_alpha = (
+                    self.union_intersect_adjacent_skeletal_mask_alpha_start + (
+                        self.union_intersect_adjacent_skeletal_mask_alpha_end - self.union_intersect_adjacent_skeletal_mask_alpha_start
+                        ) * t)
+                self.skeletal_radius_multiplier = (
+                    self.skeletal_radius_multiplier_start + (
+                        self.skeletal_radius_multiplier_end - self.skeletal_radius_multiplier_start
+                        ) * t)
 
             lr = self.optimizer.param_groups[0]["lr"]
             msg = f"Epoch {e}/{epochs} (lr={lr}), train loss {float(train_loss):.5f}"
@@ -447,7 +1046,91 @@ class PoseTrainingRunner(TrainingRunner[PoseModel]):
             underlying_model = self.model
 
         target = underlying_model.get_target(outputs, batch["annotations"])
+
+        # Apply skeletal-aware masking to target heatmaps if skeletal data is available
+        if self.truncate_targets and "skeletal_data" in batch:
+            # Get bodyparts from model config metadata
+            if hasattr(self, 'model_cfg') and 'metadata' in self.model_cfg and 'bodyparts' in self.model_cfg['metadata']:
+                bodyparts = self.model_cfg['metadata']['bodyparts']
+
+                skeleletal_radius_multiplier = self.skeletal_radius_multiplier
+                # if hasattr(self, 'model_cfg') and 'skeletal_radius_multiplier' in self.model_cfg:
+                #     skeleletal_radius_multiplier = self.model_cfg['skeletal_radius_multiplier']
+
+                union_intersect_adjacent_skeletal_mask_alpha = self.union_intersect_adjacent_skeletal_mask_alpha
+                # if hasattr(self, 'model_cfg') and 'union_intersect_adjacent_skeletal_mask_alpha' in self.model_cfg:
+                #     union_intersect_adjacent_skeletal_mask_alpha = self.model_cfg['union_intersect_adjacent_skeletal_mask_alpha']
+
+                # Get the stride for the bodypart head
+                try:
+                    stride = underlying_model.get_stride("bodypart")
+                except (AttributeError, KeyError):
+                    # Fallback to default stride if not available
+                    stride = 4.0
+
+                if self.use_skeletal_reference:
+                    target = apply_skeletal_target_masking(
+                        target=target,
+                        batch_annotations=batch["annotations"],
+                        skeletal_data=batch["skeletal_data"],
+                        bodyparts=bodyparts,
+                        device=self.device,
+                        stride=stride,
+                        skeletal_radius_multiplier=skeleletal_radius_multiplier,
+                        union_intersect_adjacent_skeletal_mask_alpha=union_intersect_adjacent_skeletal_mask_alpha
+                    )
+                else:
+                    target = apply_skeletal_target_masking_simple(
+                        target=target,
+                        batch_annotations=batch["annotations"],
+                        bodyparts=bodyparts,
+                        device=self.device,
+                        stride=stride,
+                        skeletal_radius_multiplier=skeleletal_radius_multiplier,
+                        union_intersect_adjacent_skeletal_mask_alpha=union_intersect_adjacent_skeletal_mask_alpha
+                    )
+
         losses_dict = underlying_model.get_loss(outputs, target)
+
+        # Add skeletal constraint loss if skeletal data is available
+        if "skeletal_data" in batch:
+            # Get bodyparts from model config metadata
+            bodyparts = None
+            if hasattr(self, 'model_cfg') and 'metadata' in self.model_cfg:
+                bodyparts = self.model_cfg['metadata'].get('bodyparts')
+
+            if bodyparts is not None:
+                # Get predicted keypoints from the model outputs
+                predictions = underlying_model.get_predictions(outputs)
+                if "bodypart" in predictions and "poses" in predictions["bodypart"]:
+                    predicted_keypoints = predictions["bodypart"]["poses"]  # Shape: (batch, num_animals, num_joints, 3)
+
+                    # Get skeletal loss weight from model config or use default
+                    skeletal_loss_weight = 0.10  # Default weight
+                    if hasattr(self, 'model_cfg') and 'skeletal_loss_weight' in self.model_cfg:
+                        skeletal_loss_weight = self.model_cfg['skeletal_loss_weight']
+                    elif hasattr(self, 'model_cfg') and 'train_settings' in self.model_cfg:
+                        skeletal_loss_weight = self.model_cfg['train_settings'].get('skeletal_loss_weight', 0.10)
+
+                    # Convert skeletal data from batch format to loss function format
+                    skeletal_data_for_loss = {
+                        "links": batch["skeletal_data"]["links"],
+                        "link_lengths": batch["skeletal_data"]["link_lengths"]
+                    }
+
+                    # Get skeletal constraint loss
+                    skeletal_loss = compute_skeletal_constraint_loss(
+                        predicted_keypoints=predicted_keypoints,
+                        skeletal_data=skeletal_data_for_loss,
+                        bodyparts=bodyparts,
+                        device=self.device,
+                        loss_weight=skeletal_loss_weight
+                    )
+
+                    losses_dict["skeletal_loss"] = skeletal_loss
+                    # Create a new tensor to avoid in-place operations
+                    losses_dict["total_loss"] = losses_dict["total_loss"] + skeletal_loss
+
         if mode == "train":
             losses_dict["total_loss"].backward()
             self.optimizer.step()
@@ -696,6 +1379,7 @@ def build_training_runner(
     snapshot_path: str | Path | None = None,
     load_head_weights: bool = True,
     logger: BaseLogger | None = None,
+    model_cfg: dict | None = None,
 ) -> TrainingRunner:
     """
     Build a runner object according to a pytorch configuration file
@@ -743,6 +1427,7 @@ def build_training_runner(
         load_scheduler_state_dict=runner_config.get("load_scheduler_state_dict", True),
         logger=logger,
         load_weights_only=runner_config.get("load_weights_only", None),
+        model_cfg=model_cfg,
     )
     if task == Task.DETECT:
         return DetectorTrainingRunner(**kwargs)
