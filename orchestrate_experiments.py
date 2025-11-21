@@ -5,7 +5,7 @@ import shutil
 import uuid
 import copy
 
-N_FOLDS = 8
+N_FOLDS = 2
 N_SEEDS = 1
 SEED_OFFSET = 0
 CODE_BRANCH = 'main'
@@ -56,7 +56,9 @@ base_config = {
           'seed_idx': 0,
           'fold_idx': 0,
           'seed_offset': SEED_OFFSET,
-          'job_guid': ''
+          'job_guid': '',
+          'epochs': 1
+
         }
 
 username = os.environ['USER']

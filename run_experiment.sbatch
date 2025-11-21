@@ -55,3 +55,4 @@ apptainer exec --nv \
     python run_experiments_with_cv.py /workspace/workdir/experiment_cfg.yaml
   '
 
+find /workspace/workdir/

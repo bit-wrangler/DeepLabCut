@@ -21,7 +21,7 @@ from ruamel.yaml import YAML
 # Note: Each worker will use GPU resources, so adjust based on available GPU memory
 N_WORKERS = 1
 
-N_EPOCHS = 200
+N_EPOCHS = 1
 MODEL = 'resnet_50'
 OUTPUT_STRIDE = 16
 KEY_METRIC = 'test.rmse' #'test.mAP'
@@ -62,7 +62,7 @@ def run_single_fold(args):
     """Run a single fold+seed combination. This function is designed to be run in parallel."""
     (seed_idx, fold_idx, train_indices, test_indices, config_path_template,
      experiment_id, group_by_video, train_overrides, landmark_sets,
-     n_folds, n_seeds, num_frames, timestamp) = args
+     n_folds, n_seeds, num_frames, timestamp, epochs) = args
 
     # Create a unique config file for this fold+seed combination
     config_dir = Path(config_path_template).parent
@@ -139,7 +139,8 @@ def run_single_fold(args):
             autotune=False,
             displayiters=100,
             saveiters=5000,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            epochs=epochs
             )
 
         # d. Evaluate the trained network on the held-out test set
@@ -150,8 +151,11 @@ def run_single_fold(args):
             engine_name = deeplabcut.compat.get_project_engine(cfg).aliases[0]
             trainingset_identifier = f"{cfg['Task']}{cfg['date']}-trainset{train_fraction_percent}shuffle{shuffle_num}"
             evaluation_folder = Path(project_path) / f"evaluation-results-{engine_name}" / f"iteration-{iteration}" / trainingset_identifier
+
+            print (f"The evaluation folder is: {evaluation_folder}")
             # recursively delete evaluation folder contents, but not the folder itself
             if evaluation_folder.exists():
+                
                 for child in evaluation_folder.glob('*'):
                     if child.is_file():
                         child.unlink()
@@ -196,7 +200,7 @@ def run_single_fold(args):
             else:
                 raise ValueError("Evaluation CSV file is empty.")
 
-        return evaluation_resFalseults
+        return evaluation_results
 
     finally:
         # Clean up the temporary config file
@@ -224,6 +228,7 @@ def run_experiment(config_path, exp_cfg, landmark_sets={'all': 'all'}):
     seed_offset = exp_cfg["seed_offset"]
     experiment_id = exp_cfg["experiment_id"]
     group_by_video = exp_cfg["group_by_video"]
+    epochs = exp_cfg["epochs"]
     train_overrides = exp_cfg["train_overrides"]
 
     groups = np.array(list(map(lambda x: x[1], Data.axes[0])))
@@ -298,7 +303,8 @@ def run_experiment(config_path, exp_cfg, landmark_sets={'all': 'all'}):
         n_folds,
         n_seeds,
         num_frames,
-        timestamp
+        timestamp,
+        epochs
     )
     all_tasks.append(task_args)
 
@@ -311,7 +317,7 @@ def run_experiment(config_path, exp_cfg, landmark_sets={'all': 'all'}):
     else:
         # Sequential execution for debugging
         evaluation_results_list = [run_single_fold(task) for task in all_tasks]
-
+    print (f"Evaluation Results Contents is : {evaluation_results_list}")
     # 5. AGGREGATE AND REPORT FINAL RESULTS
     # ------------------------------------
     print(f"\n\n{'='*20} Cross-Validation Summary {'='*20}")
