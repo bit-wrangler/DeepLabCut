@@ -15,6 +15,7 @@ DATA_ARCHIVE={{DATA_ARCHIVE_PLACEHOLDER}}
 EXPERIMENT_CONFIG_FILE={{CONFIG_FILE_PLACEHOLDER}}
 APPTAINER_PATH={{APPTAINER_PATH_PLACEHOLDER}}
 CODE_BRANCH={{CODE_BRANCH_PLACEHOLDER}}
+RESULTS_DIR={{RESULTS_DIR_PLACEHOLDER}}
 
 WORKDIR=/tmp/dlc_project
 CODEDIR=/tmp/DeepLabCut
@@ -53,6 +54,7 @@ apptainer exec --nv \
   bash -lc '
     export PYTHONPATH=/workspace/DeepLabCut:$PYTHONPATH
     python run_experiments_with_cv.py /workspace/workdir/experiment_cfg.yaml
+    find /workspace/
   '
 
-find /workspace/workdir/
+cp $CODEDIR/all_results_*.csv $RESULTS_DIR/

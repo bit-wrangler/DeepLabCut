@@ -162,7 +162,6 @@ def run_single_fold(args):
                     else:
                         shutil.rmtree(child)
 
-
             deeplabcut.evaluate_network(config_path, Shuffles=[shuffle_num], plotting=False, comparisonbodyparts=landmark_set)
 
             # e. Parse evaluation results and store them
@@ -199,7 +198,12 @@ def run_single_fold(args):
                     evaluation_results.update(summary_dict)
             else:
                 raise ValueError("Evaluation CSV file is empty.")
-
+        
+        #evaluation_results = {
+        #    'field1': ['value1', 'value2', 'value3'],
+        #    'field2': [1, 2, 3],
+        #    'field3': [True, False, True]
+        #}
         return evaluation_results
 
     finally:
@@ -593,6 +597,7 @@ if __name__ == "__main__":
             landmark_sets=landmark_sets
         )
 
+    all_results.append(results)
         
     all_results_df = pd.concat(all_results)
     all_results_df.to_csv(f'all_results_{timestamp}.csv')

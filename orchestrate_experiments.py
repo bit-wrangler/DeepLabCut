@@ -31,6 +31,9 @@ os.makedirs(experiments_log_dir, exist_ok=True)
 experiment_configs_dir = Path('~/scratch/dlc-experiments/experiment_configs').expanduser()
 os.makedirs(experiment_configs_dir, exist_ok=True)
 
+results_dir = Path('~/scratch/dlc-experiments/results').expanduser()
+os.makedirs(results_dir, exist_ok=True)
+
 base_config = {
             'train_overrides': {
             'skeletal_loss_weight': 0.0,    
@@ -89,6 +92,7 @@ for seed_idx in range(N_SEEDS):
             sbatch = sbatch.replace('{{CONFIG_FILE_PLACEHOLDER}}', config_path_template.format(config_name=config_filename))
             sbatch = sbatch.replace('{{APPTAINER_PATH_PLACEHOLDER}}', apptainer_path)
             sbatch = sbatch.replace('{{CODE_BRANCH_PLACEHOLDER}}', CODE_BRANCH)
+            sbatch = sbatch.replace('{{RESULTS_DIR_PLACEHOLDER}}', str(results_dir))
 
         sbatch_filepath = os.path.join(experiment_configs_dir, sbatch_filename)
 
