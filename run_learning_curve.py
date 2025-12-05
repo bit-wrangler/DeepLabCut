@@ -294,20 +294,34 @@ def save_results_incrementally(results_df, results_file):
     print(f"Results saved to: {results_file}")
 
 
-def load_existing_results(results_file):
+def load_existing_results(results_file, seed=None):
     """
     Load existing results from CSV file if it exists.
 
     Args:
         results_file: Path to the results file
+        seed: Optional seed to filter results for
 
     Returns:
-        pd.DataFrame or None: Existing results or None if file doesn't exist
+        tuple: (all_results_df, seed_results_df) where:
+            - all_results_df: All results from the file (or None)
+            - seed_results_df: Results filtered by seed (or None)
     """
     if os.path.exists(results_file):
         print(f"Loading existing results from: {results_file}")
-        return pd.read_csv(results_file)
-    return None
+        all_results = pd.read_csv(results_file)
+
+        if seed is not None and 'seed' in all_results.columns:
+            seed_results = all_results[all_results['seed'] == seed]
+            if len(seed_results) > 0:
+                print(f"  Found {len(seed_results)} existing results for seed {seed}")
+                return all_results, seed_results
+            else:
+                print(f"  No existing results found for seed {seed}")
+                return all_results, None
+
+        return all_results, None
+    return None, None
 
 
 def run_learning_curve(config_path, lc_cfg):
@@ -328,6 +342,7 @@ def run_learning_curve(config_path, lc_cfg):
     experiment_id = lc_cfg.get('experiment_id', 'lc_experiment')
     epochs = lc_cfg.get('epochs', 50)
     start_from_step = lc_cfg.get('start_from_step', 0)
+    force_rerun = lc_cfg.get('force_rerun', False)
     train_overrides = lc_cfg.get('train_overrides', {})
 
     print(f"\n{'='*60}")
@@ -350,27 +365,65 @@ def run_learning_curve(config_path, lc_cfg):
 
     num_frames = len(Data)
 
-    # Prepare results file
-    results_file = f'lc_results_{experiment_id}_{timestamp}.csv'
+    # Prepare results file (use consistent name without timestamp for aggregation)
+    results_file = f'lc_results_{experiment_id}.csv'
 
-    # Load existing results if resuming
-    existing_results = None
-    if start_from_step > 0:
-        # Try to find existing results file
-        existing_files = sorted(Path('.').glob(f'lc_results_{experiment_id}_*.csv'))
-        if existing_files:
-            latest_file = existing_files[-1]
-            existing_results = load_existing_results(str(latest_file))
-            results_file = str(latest_file)  # Continue using the same file
-            print(f"Resuming from step {start_from_step}")
+    # Load existing results (always check, not just when resuming)
+    all_existing_results, seed_existing_results = load_existing_results(results_file, seed)
 
-    # Initialize results list
+    # Determine starting step based on existing results for this seed
+    actual_start_step = start_from_step
+    if seed_existing_results is not None and len(seed_existing_results) > 0:
+        completed_steps = seed_existing_results['step'].values
+        max_completed_step = completed_steps.max()
+
+        if force_rerun:
+            # Force re-run: remove all existing results for this seed
+            print(f"\nForce re-run enabled: Removing all existing results for seed {seed}")
+            if all_existing_results is not None:
+                all_existing_results = all_existing_results[all_existing_results['seed'] != seed]
+            actual_start_step = 0
+        elif start_from_step == 0:
+            # Auto-resume from where this seed left off
+            actual_start_step = max_completed_step + 1
+            if actual_start_step < n_steps:
+                print(f"\nFound existing results for seed {seed} up to step {max_completed_step}")
+                print(f"Auto-resuming from step {actual_start_step}")
+            elif actual_start_step >= n_steps:
+                # All steps already complete for this seed
+                print(f"\n{'='*60}")
+                print(f"WARNING: Seed {seed} already has complete results (all {n_steps} steps)")
+                print(f"{'='*60}")
+                print(f"To re-run this seed, set 'force_rerun: true' in your config file")
+                print(f"Skipping execution to avoid duplicate results.")
+                print(f"{'='*60}\n")
+                # Return existing results without running anything
+                return pd.DataFrame(all_existing_results.to_dict('records'))
+        else:
+            # User specified start_from_step, validate it
+            if start_from_step <= max_completed_step:
+                print(f"\nWarning: Seed {seed} already has results up to step {max_completed_step}")
+                print(f"Starting from step {start_from_step} will overwrite existing results for this seed")
+                # Remove existing results for this seed from this step onwards
+                if all_existing_results is not None:
+                    all_existing_results = all_existing_results[
+                        ~((all_existing_results['seed'] == seed) &
+                          (all_existing_results['step'] >= start_from_step))
+                    ]
+
+    # Initialize results list with existing results from OTHER seeds
     all_results = []
-    if existing_results is not None:
-        all_results = existing_results.to_dict('records')
+    if all_existing_results is not None:
+        # Keep results from other seeds, and results from this seed before actual_start_step
+        other_results = all_existing_results[
+            (all_existing_results['seed'] != seed) |
+            (all_existing_results['step'] < actual_start_step)
+        ]
+        all_results = other_results.to_dict('records')
+        print(f"\nRetaining {len(other_results)} existing results from other seeds/steps")
 
-    # Run learning curve steps
-    for step_idx in range(start_from_step, n_steps):
+    # Run learning curve steps (use actual_start_step which may be auto-adjusted)
+    for step_idx in range(actual_start_step, n_steps):
         print(f"\n{'='*60}")
         print(f"Preparing Step {step_idx + 1}/{n_steps}")
         print(f"{'='*60}")
@@ -421,14 +474,22 @@ def run_learning_curve(config_path, lc_cfg):
     print(f"\n\n{'='*60}")
     print(f"Learning Curve Analysis Complete")
     print(f"{'='*60}")
-    print(f"Total steps completed: {n_steps}")
+    print(f"Total steps completed for seed {seed}: {n_steps}")
     print(f"Results saved to: {results_file}")
 
-    # Display summary statistics
+    # Display summary statistics for current seed
     results_df = pd.DataFrame(all_results)
-    print("\nLearning Curve Summary:")
+    current_seed_results = results_df[results_df['seed'] == seed].sort_values('step')
+
+    print(f"\nLearning Curve Summary (Seed {seed}):")
     summary_cols = ['step', 'train_fraction', 'train_fraction_of_total', 'train_size', 'test_size', 'all__test rmse']
-    print(results_df[summary_cols].to_string(index=False))
+    print(current_seed_results[summary_cols].to_string(index=False))
+
+    # Show info about other seeds if present
+    other_seeds = results_df[results_df['seed'] != seed]['seed'].unique()
+    if len(other_seeds) > 0:
+        print(f"\nNote: Results file also contains data for seeds: {sorted(other_seeds)}")
+        print(f"Total results in file: {len(results_df)} rows across {len(results_df['seed'].unique())} seeds")
 
     return results_df
 
