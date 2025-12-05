@@ -1,0 +1,42 @@
+# Learning Curve Configuration Example
+# This file configures the learning curve analysis script
+
+# Path to the DeepLabCut project config.yaml file
+# IMPORTANT: Update this path to point to your actual config.yaml file
+config_path: '/home/alek/projects/cdl-test1/data/cdl-projects/test1-haag-2025-05-21/config_full.yaml'
+
+# Experiment identifier (used in results filename)
+experiment_id: 'lc_baseline'
+
+# Fraction of data to set aside as test set (0.0 to 1.0)
+# The remaining data will be used for training
+test_fraction: 0.2
+
+# Number of learning curve steps
+# Each step will use progressively more training data
+# Example with 5 steps: 20%, 40%, 60%, 80%, 100% of available training data
+n_steps: 5
+
+# Random seed for reproducibility
+seed: 42
+
+# Whether to group frames by video when splitting
+# If true, entire videos stay together in train or test sets
+# If false, frames are split randomly regardless of video
+group_by_video: false
+
+# Number of training epochs per step
+epochs: 200
+
+# Step to start from (useful for resuming interrupted runs)
+# Set to 0 to start from the beginning
+# Set to N to skip the first N steps (0-indexed)
+start_from_step: 0
+
+# Training parameter overrides
+# These will be applied to the pytorch_config.yaml for each training run
+# Note: Skeletal-related parameters are NOT used in this script
+train_overrides:
+  runner.key_metric: 'test.rmse'
+  runner.key_metric_asc: false
+
