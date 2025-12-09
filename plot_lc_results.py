@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import sys
 
 # Hardcoded results file name
-FILENAME = 'lc_results_lc_baseline_20251205-022006.csv'
+FILENAME = 'lc_results_lc_baseline.csv'
 
 
 def plot_learning_curve(filename):
@@ -46,7 +46,7 @@ def plot_learning_curve(filename):
     
     # Set logarithmic scale on x-axis
     plt.xscale('log')
-    
+
     # Labels and title
     plt.xlabel('Training Size (frames)', fontsize=12)
     plt.ylabel('Test RMSE (pixels)', fontsize=12)
