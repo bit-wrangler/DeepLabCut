@@ -192,6 +192,55 @@ def run_single_fold(args):
 
 
 
+def save_results_incrementally(results_df, results_file):
+    """
+    Save results to CSV file incrementally.
+
+    Args:
+        results_df: DataFrame containing results
+        results_file: Path to the results file
+    """
+    results_df.to_csv(results_file, index=False)
+    print(f"Results saved to: {results_file}")
+
+
+def load_existing_results(results_file):
+    """
+    Load existing results from CSV file if it exists.
+
+    Args:
+        results_file: Path to the results file
+
+    Returns:
+        pd.DataFrame or None: Existing results or None if file doesn't exist
+    """
+    if os.path.exists(results_file):
+        print(f"Loading existing results from: {results_file}")
+        existing_results = pd.read_csv(results_file)
+        print(f"  Found {len(existing_results)} existing results")
+        return existing_results
+    return None
+
+
+def is_task_completed(existing_results, seed_idx, fold_idx):
+    """
+    Check if a specific fold+seed combination has already been completed.
+
+    Args:
+        existing_results: DataFrame with existing results
+        seed_idx: Seed index
+        fold_idx: Fold index
+
+    Returns:
+        bool: True if task is already completed
+    """
+    if existing_results is None or len(existing_results) == 0:
+        return False
+
+    mask = (existing_results['seed'] == seed_idx) & (existing_results['fold'] == fold_idx)
+    return mask.any()
+
+
 def run_experiment(config_path, n_folds, n_seeds, experiment_id='experiment_1', group_by_video=False, train_overrides={}, landmark_sets={'all': 'all'}):
     """Run cross-validation experiment with sequential processing of folds and seeds."""
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -206,8 +255,21 @@ def run_experiment(config_path, n_folds, n_seeds, experiment_id='experiment_1', 
     num_frames = len(Data)
     print(f"Total number of labeled frames: {num_frames}")
 
+    # Prepare results file (without timestamp for recovery)
+    results_file = f'cv_results_{experiment_id}.csv'
+
+    # Load existing results
+    existing_results = load_existing_results(results_file)
+
+    # Initialize results list with existing results
+    all_results = []
+    if existing_results is not None:
+        all_results = existing_results.to_dict('records')
+        print(f"\nRetaining {len(existing_results)} existing results")
+
     # Prepare all fold+seed combinations
     all_tasks = []
+    skipped_tasks = 0
     for i in range(n_seeds):
         print(f"\n\n{'='*20} Preparing SEED {i+1}/{n_seeds} {'='*20}")
 
@@ -226,6 +288,12 @@ def run_experiment(config_path, n_folds, n_seeds, experiment_id='experiment_1', 
             folds = list(cv.split(np.arange(num_frames)))
 
         for j, (train_indices, test_indices) in enumerate(folds):
+            # Check if this task is already completed
+            if is_task_completed(existing_results, i, j):
+                print(f"  Skipping Seed {i+1} Fold {j+1} (already completed)")
+                skipped_tasks += 1
+                continue
+
             task_args = (
                 i,  # seed_idx
                 j,  # fold_idx
@@ -243,21 +311,51 @@ def run_experiment(config_path, n_folds, n_seeds, experiment_id='experiment_1', 
             )
             all_tasks.append(task_args)
 
+    if skipped_tasks > 0:
+        print(f"\n{'='*60}")
+        print(f"Skipped {skipped_tasks} already completed tasks")
+        print(f"{'='*60}")
+
+    if len(all_tasks) == 0:
+        print(f"\n{'='*60}")
+        print(f"All tasks already completed!")
+        print(f"{'='*60}")
+        return pd.DataFrame(all_results)
+
     print(f"\n\n{'='*20} Running {len(all_tasks)} tasks sequentially {'='*20}")
 
-    # Run tasks sequentially
-    evaluation_results_list = [run_single_fold(task) for task in all_tasks]
+    # Run tasks sequentially with incremental saving
+    for task_idx, task in enumerate(all_tasks):
+        seed_idx, fold_idx = task[0], task[1]
+        print(f"\n{'='*60}")
+        print(f"Task {task_idx + 1}/{len(all_tasks)}: Seed {seed_idx+1}/{n_seeds}, Fold {fold_idx+1}/{n_folds}")
+        print(f"{'='*60}")
+
+        try:
+            result = run_single_fold(task)
+            all_results.append(result)
+
+            # Save results incrementally after each task
+            results_df = pd.DataFrame(all_results)
+            save_results_incrementally(results_df, results_file)
+
+            print(f"\n✓ Task {task_idx + 1}/{len(all_tasks)} completed successfully")
+
+        except Exception as e:
+            print(f"\n✗ Task {task_idx + 1}/{len(all_tasks)} failed with error: {e}")
+            print(f"Results up to this point have been saved to: {results_file}")
+            print(f"To resume, simply run the script again - it will skip completed tasks")
+            raise
 
     # 5. AGGREGATE AND REPORT FINAL RESULTS
     # ------------------------------------
     print(f"\n\n{'='*20} Cross-Validation Summary {'='*20}")
 
-    results_df = pd.DataFrame(evaluation_results_list)
+    results_df = pd.DataFrame(all_results)
     return results_df
 
 
 if __name__ == "__main__":
-    import uuid
     # skeletal_loss_weight: 0.0
     # skeletal_radius_multiplier_start: 1.15
     # skeletal_radius_multiplier_end: 1.15
@@ -270,7 +368,6 @@ if __name__ == "__main__":
     # model.heads.bodypart.predictor.locref_std: 7.2801
     # model.heads.bodypart.target_generator.locref_std: 7.2801
     # model.heads.bodypart.target_generator.pos_dist_thresh: 17\
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     landmark_sets={
         'all':'all',
         'truncated': ['left_elbow', 'left_wrist', 'right_elbow', 'right_wrist', 'left_knee', 'left_ankle', 'right_knee', 'right_ankle'],
@@ -278,10 +375,10 @@ if __name__ == "__main__":
         }
     experiment = {
             'train_overrides': {
-            'skeletal_loss_weight': 0.0,
+            'skeletal_loss_weight': 0.025,
             'skeletal_loss_radius_multiplier': 1.0,
-            'skeletal_radius_multiplier_start': 0.80,
-            'skeletal_radius_multiplier_end': 0.80,
+            'skeletal_radius_multiplier_start': 1.05,
+            'skeletal_radius_multiplier_end': 1.05,
             'union_intersect_adjacent_skeletal_mask_alpha_start': 0.0,
             'union_intersect_adjacent_skeletal_mask_alpha_end': 0.0,
             'union_intersect_adjacent_skeletal_mask_start_epoch': 0,
@@ -295,25 +392,19 @@ if __name__ == "__main__":
             'runner.key_metric_asc': False,
             'train_settings.batch_size': TRAIN_BATCH_SIZE,
           },
-          'experiment_id': 'control',
+          'experiment_id': 'll_0d025',
           'group_by_video': True,
         }
 
-    all_results = []
-
     results: pd.DataFrame = run_experiment(
-        config_path, 
-        N_FOLDS, 
-        N_SEEDS, 
+        config_path,
+        N_FOLDS,
+        N_SEEDS,
         experiment['experiment_id'],
-        group_by_video=experiment['group_by_video'], 
-        train_overrides=experiment['train_overrides'], 
+        group_by_video=experiment['group_by_video'],
+        train_overrides=experiment['train_overrides'],
         landmark_sets=landmark_sets
     )
 
-    result_timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    results.to_csv(f'results_cv_{result_timestamp}_{uuid.uuid4()}.csv')
-    all_results.append(results)
-
-    all_results_df = pd.concat(all_results)
-    all_results_df.to_csv(f'all_cv_results_{timestamp}.csv')
+    print("\n✓ Cross-validation completed successfully!")
+    print(f"Final results saved to: cv_results_{experiment['experiment_id']}.csv")
