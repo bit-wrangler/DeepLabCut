@@ -33,7 +33,7 @@ if not os.path.exists(config_path):
 
 # Number of folds for cross-validation
 N_FOLDS = 5
-N_SEEDS = 2
+N_SEEDS = 8
 SHUFFLE_OFFSET = 100
 
 # Note: Shuffle numbers are automatically assigned to prevent collisions
@@ -375,7 +375,7 @@ if __name__ == "__main__":
         }
     experiment = {
             'train_overrides': {
-            'skeletal_loss_weight': 0.025,
+            'skeletal_loss_weight': 0.0,
             'skeletal_loss_radius_multiplier': 1.0,
             'skeletal_radius_multiplier_start': 1.05,
             'skeletal_radius_multiplier_end': 1.05,
@@ -392,7 +392,7 @@ if __name__ == "__main__":
             'runner.key_metric_asc': False,
             'train_settings.batch_size': TRAIN_BATCH_SIZE,
           },
-          'experiment_id': 'll_0d025',
+          'experiment_id': 'control',
           'group_by_video': True,
         }
 
@@ -408,3 +408,23 @@ if __name__ == "__main__":
 
     print("\n✓ Cross-validation completed successfully!")
     print(f"Final results saved to: cv_results_{experiment['experiment_id']}.csv")
+
+
+#     Starting pose model training...
+# --------------------------------------------------
+# Epoch 1/200 (lr=0.0005), train loss 0.01404
+# Epoch 2/200 (lr=0.0005), train loss 0.00876
+# Epoch 3/200 (lr=0.0005), train loss 0.00645
+# Epoch 4/200 (lr=0.0005), train loss 0.00517
+# Epoch 5/200 (lr=0.0005), train loss 0.00441
+# Epoch 6/200 (lr=0.0005), train loss 0.00406
+# Epoch 7/200 (lr=0.0005), train loss 0.00363
+# Epoch 8/200 (lr=0.0005), train loss 0.00347
+# Epoch 9/200 (lr=0.0005), train loss 0.00326
+# Training for epoch 10 done, starting evaluation
+# Epoch 10/200 (lr=0.0005), train loss 0.00300, valid loss 0.00497
+# Model performance:
+#   metrics/test.rmse:          18.06
+#   metrics/test.rmse_pcutoff:   5.82
+#   metrics/test.mAP:           77.99
+#   metrics/test.mAR:           80.96
