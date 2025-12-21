@@ -16,6 +16,7 @@ MODEL = 'resnet_50'
 OUTPUT_STRIDE = 16
 KEY_METRIC = 'test.rmse' #'test.mAP'
 TRAIN_BATCH_SIZE = 48
+SAVE_FRAME_LEVEL_RESULTS = True  # Set to True to aggregate frame-level validation results
 # CUSTOM_WEIGHTS = '/home/alek/projects/cdl-test1/resnet50_unet_encoder_tuned.pth'
 
 # 1. DEFINE CONFIGURATION AND PARAMETERS
@@ -145,7 +146,35 @@ def run_single_fold(args):
                         shutil.rmtree(child)
 
 
-            deeplabcut.evaluate_network(config_path, Shuffles=[shuffle_num], plotting=False, comparisonbodyparts=landmark_set)
+            deeplabcut.evaluate_network(
+                config_path,
+                Shuffles=[shuffle_num],
+                plotting=False,
+                comparisonbodyparts=landmark_set,
+                save_frame_level_results=SAVE_FRAME_LEVEL_RESULTS
+            )
+
+            # Parse and aggregate frame-level results (if enabled)
+            if SAVE_FRAME_LEVEL_RESULTS:
+                # Find frame-level CSV file
+                frame_level_csv_files = list(evaluation_folder.glob('*-frame-level-results.csv'))
+
+                if frame_level_csv_files:
+                    # Read the frame-level CSV
+                    df_frame_level = pd.read_csv(frame_level_csv_files[0])
+
+                    # Add metadata columns at the beginning
+                    df_frame_level.insert(0, 'shuffle_num', shuffle_num)
+                    df_frame_level.insert(0, 'landmark_set_name', landmark_set_name)
+                    df_frame_level.insert(0, 'experiment_id', experiment_id)
+                    df_frame_level.insert(0, 'seed', seed_idx)
+                    df_frame_level.insert(0, 'fold', fold_idx)
+
+                    # Append to landmark-set-specific aggregate file
+                    aggregate_file = f'cv_frame_level_results_{experiment_id}_{landmark_set_name}.csv'
+                    save_frame_level_results_incrementally(df_frame_level, aggregate_file)
+                else:
+                    print(f"Warning: No frame-level CSV found in {evaluation_folder}")
 
             # e. Parse evaluation results and store them
             print(f"  Parsing evaluation results for shuffle {shuffle_num}...")
@@ -202,6 +231,29 @@ def save_results_incrementally(results_df, results_file):
     """
     results_df.to_csv(results_file, index=False)
     print(f"Results saved to: {results_file}")
+
+
+def save_frame_level_results_incrementally(results_df, results_file):
+    """
+    Save frame-level results to CSV file incrementally.
+
+    Appends new frame-level results to an existing aggregate file, or creates
+    a new file if it doesn't exist. Each landmark set has its own aggregate file.
+
+    Args:
+        results_df: DataFrame containing frame-level results with metadata columns
+                   (fold, seed, experiment_id, landmark_set_name, shuffle_num)
+        results_file: Path to the aggregate results file
+    """
+    # Load existing data if file exists
+    if os.path.exists(results_file):
+        existing_df = pd.read_csv(results_file)
+        combined_df = pd.concat([existing_df, results_df], ignore_index=True)
+    else:
+        combined_df = results_df
+
+    combined_df.to_csv(results_file, index=False)
+    print(f"Frame-level results appended to: {results_file} ({len(results_df)} new rows)")
 
 
 def load_existing_results(results_file):
