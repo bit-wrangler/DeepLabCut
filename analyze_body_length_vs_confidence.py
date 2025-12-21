@@ -35,7 +35,7 @@ import sys
 # Configuration
 # ============================================================================
 
-EXPERIMENT_ID = 'll_0d025'          # Experiment to analyze
+EXPERIMENT_ID = 'control'          # Experiment to analyze
 LANDMARK_SET_NAME = 'all'           # Landmark set ('all', 'truncated', etc.)
 
 # Body length calculation settings
@@ -358,6 +358,7 @@ def generate_harmonic_mean_plot(df, experiment_id, landmark_set_name, output_dir
 def generate_error_distribution_histogram(df, experiment_id, landmark_set_name, output_dir, plot_settings):
     """
     Create histogram showing relative error distributions for different confidence cutoffs.
+    Uses side-by-side bars for better readability.
 
     Args:
         df: DataFrame with computed metrics
@@ -380,10 +381,16 @@ def generate_error_distribution_histogram(df, experiment_id, landmark_set_name, 
     # Determine bin edges for consistent binning across all distributions
     # Use relative error in percentage
     max_error = min(df['relative_error'].max() * 100, 100)  # Cap at 100%
-    bins = np.linspace(0, max_error, 30)
+    n_bins = 25
+    bins = np.linspace(0, max_error, n_bins + 1)
+    bin_width = bins[1] - bins[0]
 
-    # Plot histogram for each cutoff
-    for cutoff, color in zip(cutoffs, colors):
+    # Calculate width for each bar (divide bin width by number of cutoffs)
+    n_cutoffs = len(cutoffs)
+    bar_width = bin_width / n_cutoffs
+
+    # Plot histogram for each cutoff with offset positions
+    for i, (cutoff, color) in enumerate(zip(cutoffs, colors)):
         # Filter data by confidence cutoff
         df_cutoff = df[df['mean_confidence'] >= cutoff]
 
@@ -391,10 +398,18 @@ def generate_error_distribution_histogram(df, experiment_id, landmark_set_name, 
             # Convert relative error to percentage
             errors_pct = df_cutoff['relative_error'] * 100
 
-            # Plot histogram with transparency
-            ax.hist(errors_pct, bins=bins, alpha=0.5, color=color,
+            # Compute histogram
+            counts, _ = np.histogram(errors_pct, bins=bins)
+
+            # Calculate bar positions (offset for side-by-side display)
+            # Center the group of bars within each bin
+            offset = (i - (n_cutoffs - 1) / 2) * bar_width
+            bar_positions = bins[:-1] + bin_width / 2 + offset
+
+            # Plot bars
+            ax.bar(bar_positions, counts, width=bar_width * 0.9, color=color,
                    label=f'Conf ≥ {cutoff} (n={len(df_cutoff)})',
-                   edgecolor='black', linewidth=0.5)
+                   edgecolor='black', linewidth=0.5, alpha=0.8)
 
     # Set labels and title
     ax.set_xlabel('Relative Error (%)', fontsize=12)
@@ -407,6 +422,9 @@ def generate_error_distribution_histogram(df, experiment_id, landmark_set_name, 
 
     # Add grid
     ax.grid(True, alpha=0.3, axis='y')
+
+    # Set x-axis limits
+    ax.set_xlim(0, max_error)
 
     # Tight layout
     plt.tight_layout()
