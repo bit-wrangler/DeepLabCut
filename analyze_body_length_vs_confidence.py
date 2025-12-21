@@ -15,9 +15,10 @@ The script will:
     - Calculate body length (SVL) from snout and tail1 positions
     - Calculate prediction errors (absolute and relative)
     - Calculate confidence metrics (arithmetic mean, harmonic mean, and min)
-    - Generate two scatter plots:
-        1. Error vs arithmetic mean confidence
-        2. Error vs harmonic mean confidence
+    - Generate three plots:
+        1. Scatter plot: Error vs arithmetic mean confidence
+        2. Scatter plot: Error vs harmonic mean confidence
+        3. Histogram: Error distributions by confidence cutoffs (≥0.95, ≥0.9, ≥0.8, ≥0.5)
     - Optionally save computed metrics to CSV
 
 Note: Harmonic mean is more sensitive to low confidence values than arithmetic mean,
@@ -354,6 +355,84 @@ def generate_harmonic_mean_plot(df, experiment_id, landmark_set_name, output_dir
     print(f"Harmonic mean plot saved to: {output_filename}")
 
 
+def generate_error_distribution_histogram(df, experiment_id, landmark_set_name, output_dir, plot_settings):
+    """
+    Create histogram showing relative error distributions for different confidence cutoffs.
+
+    Args:
+        df: DataFrame with computed metrics
+        experiment_id: Experiment identifier
+        landmark_set_name: Landmark set name
+        output_dir: Directory to save plot
+        plot_settings: Dictionary with plot configuration
+    """
+    if len(df) == 0:
+        print("Warning: No data to plot. Skipping histogram generation.")
+        return
+
+    # Define confidence cutoffs
+    cutoffs = [0.95, 0.9, 0.8, 0.5]
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']  # Blue, orange, green, red
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=plot_settings['figsize'])
+
+    # Determine bin edges for consistent binning across all distributions
+    # Use relative error in percentage
+    max_error = min(df['relative_error'].max() * 100, 100)  # Cap at 100%
+    bins = np.linspace(0, max_error, 30)
+
+    # Plot histogram for each cutoff
+    for cutoff, color in zip(cutoffs, colors):
+        # Filter data by confidence cutoff
+        df_cutoff = df[df['mean_confidence'] >= cutoff]
+
+        if len(df_cutoff) > 0:
+            # Convert relative error to percentage
+            errors_pct = df_cutoff['relative_error'] * 100
+
+            # Plot histogram with transparency
+            ax.hist(errors_pct, bins=bins, alpha=0.5, color=color,
+                   label=f'Conf ≥ {cutoff} (n={len(df_cutoff)})',
+                   edgecolor='black', linewidth=0.5)
+
+    # Set labels and title
+    ax.set_xlabel('Relative Error (%)', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.set_title(f'Error Distribution by Confidence Cutoff: {experiment_id} ({landmark_set_name})',
+                fontsize=14, fontweight='bold')
+
+    # Add legend
+    ax.legend(loc='upper right', fontsize=10)
+
+    # Add grid
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Tight layout
+    plt.tight_layout()
+
+    # Save plot
+    output_filename = f'body_length_error_distribution_{experiment_id}_{landmark_set_name}.png'
+    output_path = os.path.join(output_dir, output_filename)
+    plt.savefig(output_path, dpi=plot_settings['dpi'], bbox_inches='tight')
+    plt.close()
+
+    print(f"Error distribution histogram saved to: {output_filename}")
+
+    # Print summary statistics for each cutoff
+    print("\nError distribution statistics by confidence cutoff:")
+    for cutoff in cutoffs:
+        df_cutoff = df[df['mean_confidence'] >= cutoff]
+        if len(df_cutoff) > 0:
+            mean_error = df_cutoff['relative_error'].mean() * 100
+            median_error = df_cutoff['relative_error'].median() * 100
+            std_error = df_cutoff['relative_error'].std() * 100
+            print(f"  Conf ≥ {cutoff}: n={len(df_cutoff):4d}, "
+                  f"mean={mean_error:5.2f}%, median={median_error:5.2f}%, std={std_error:5.2f}%")
+        else:
+            print(f"  Conf ≥ {cutoff}: No data")
+
+
 def save_computed_metrics(df, experiment_id, landmark_set_name, output_dir):
     """
     Save DataFrame with computed metrics to CSV file.
@@ -493,9 +572,9 @@ def main():
     # 7. Print summary statistics
     print_summary_statistics(df, df_filtered)
 
-    # 8. Generate scatter plots
+    # 8. Generate plots
     print(f"\n{'='*60}")
-    print("Generating scatter plots...")
+    print("Generating plots...")
     plot_settings = {
         'figsize': PLOT_FIGSIZE,
         'alpha': PLOT_ALPHA,
@@ -504,14 +583,19 @@ def main():
     }
 
     # Plot 1: Mean confidence (arithmetic mean)
-    print("\n1. Generating plot with arithmetic mean confidence...")
+    print("\n1. Generating scatter plot with arithmetic mean confidence...")
     generate_scatter_plot(df_filtered, EXPERIMENT_ID, LANDMARK_SET_NAME,
                          OUTPUT_DIR, plot_settings)
 
     # Plot 2: Harmonic mean confidence
-    print("2. Generating plot with harmonic mean confidence...")
+    print("2. Generating scatter plot with harmonic mean confidence...")
     generate_harmonic_mean_plot(df_filtered, EXPERIMENT_ID, LANDMARK_SET_NAME,
                                 OUTPUT_DIR, plot_settings)
+
+    # Plot 3: Error distribution histogram by confidence cutoffs
+    print("3. Generating error distribution histogram by confidence cutoffs...")
+    generate_error_distribution_histogram(df_filtered, EXPERIMENT_ID, LANDMARK_SET_NAME,
+                                         OUTPUT_DIR, plot_settings)
 
     # 9. Optionally save computed metrics
     if SAVE_COMPUTED_METRICS:
