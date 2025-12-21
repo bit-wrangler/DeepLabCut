@@ -43,6 +43,76 @@ def pairwisedistances(DataCombined, scorer1, scorer2, pcutoff=-1, bodyparts=None
         return RMSE, RMSE[mask]
 
 
+def create_frame_level_results_tf(
+    ground_truth: pd.DataFrame,
+    predictions: pd.DataFrame,
+    test_indices: List[int],
+    scorer_gt: str,
+    scorer_pred: str,
+) -> pd.DataFrame:
+    """
+    Creates a frame-level results DataFrame for test set evaluation.
+
+    This function generates a CSV-friendly DataFrame containing ground truth positions,
+    predicted positions, and confidence scores for each bodypart in each test frame.
+
+    Args:
+        ground_truth: DataFrame with ground truth annotations (MultiIndex columns:
+            scorer, bodyparts, coords)
+        predictions: DataFrame with model predictions (MultiIndex columns:
+            scorer, bodyparts, coords including 'likelihood')
+        test_indices: List of indices for test set frames (integer positions in DataFrame)
+        scorer_gt: Name of the ground truth scorer (human annotator)
+        scorer_pred: Name of the prediction scorer (DLC model)
+
+    Returns:
+        DataFrame with columns: frame_index, image_path, gt_{bodypart}_x,
+        gt_{bodypart}_y, pred_{bodypart}_x, pred_{bodypart}_y, conf_{bodypart}
+        for each bodypart. Contains only test set frames.
+    """
+    # Get bodyparts list from ground truth DataFrame
+    bodyparts = (
+        ground_truth[scorer_gt].columns.get_level_values("bodyparts").unique().tolist()
+    )
+
+    # Build column names
+    columns = ["frame_index", "image_path"]
+    for bp in bodyparts:
+        columns.extend(
+            [f"gt_{bp}_x", f"gt_{bp}_y", f"pred_{bp}_x", f"pred_{bp}_y", f"conf_{bp}"]
+        )
+
+    # Build rows - iterate through test indices
+    rows = []
+    for frame_idx, data_idx in enumerate(test_indices):
+        # Get the image path from the original DataFrame using integer position
+        image_path = ground_truth.index[data_idx]
+
+        # Convert image path to string (handle both tuple and string formats)
+        if isinstance(image_path, tuple):
+            image_path_str = str(Path(*image_path))
+        else:
+            image_path_str = str(image_path)
+
+        row = [frame_idx, image_path_str]
+
+        for bp in bodyparts:
+            # Ground truth coordinates - use iloc for integer position
+            gt_x = ground_truth.iloc[data_idx][(scorer_gt, bp, "x")]
+            gt_y = ground_truth.iloc[data_idx][(scorer_gt, bp, "y")]
+
+            # Predicted coordinates and confidence - use iloc for integer position
+            pred_x = predictions.iloc[data_idx][(scorer_pred, bp, "x")]
+            pred_y = predictions.iloc[data_idx][(scorer_pred, bp, "y")]
+            conf = predictions.iloc[data_idx][(scorer_pred, bp, "likelihood")]
+
+            row.extend([gt_x, gt_y, pred_x, pred_y, conf])
+
+        rows.append(row)
+
+    return pd.DataFrame(rows, columns=columns)
+
+
 def calculatepafdistancebounds(
     config, shuffle=0, trainingsetindex=0, modelprefix="", numdigits=0, onlytrain=False
 ):
@@ -542,6 +612,7 @@ def evaluate_network(
     modelprefix="",
     per_keypoint_evaluation: bool = False,
     snapshots_to_evaluate: List[str] = None,
+    save_frame_level_results: bool = True,
 ):
     """Evaluates the network.
 
@@ -601,6 +672,11 @@ def evaluate_network(
 
     snapshots_to_evaluate: List[str], optional, default=None
         List of snapshot names to evaluate (e.g. ["snapshot-50000", "snapshot-75000", ...])
+
+    save_frame_level_results: bool, default=True
+        Save frame-by-frame ground truth, predictions, and confidence scores to a CSV file
+        named {model_name}-frame-level-results.csv in the evaluation-results folder.
+        The CSV contains detailed data for each frame in the test set only.
 
     Returns
     -------
@@ -934,6 +1010,20 @@ def evaluate_network(
                             df_keypoint_error.to_csv(
                                 Path(evaluationfolder) / kpt_filename
                             )
+
+                        # Save frame-level results CSV
+                        if save_frame_level_results:
+                            df_frame_level = create_frame_level_results_tf(
+                                ground_truth=Data,
+                                predictions=DataMachine,
+                                test_indices=testIndices,
+                                scorer_gt=cfg["scorer"],
+                                scorer_pred=DLCscorer,
+                            )
+                            frame_level_filename = DLCscorer + "-frame-level-results.csv"
+                            frame_level_path = Path(evaluationfolder) / frame_level_filename
+                            df_frame_level.to_csv(frame_level_path, index=False)
+                            print(f"Frame-level results saved to: {frame_level_filename}")
 
                         if show_errors:
                             print(
