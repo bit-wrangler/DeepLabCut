@@ -180,8 +180,9 @@ def run_single_fold(args):
             print(f"  Parsing evaluation results for shuffle {shuffle_num}...")
             # Construct the path to the evaluation folder
 
-            # Find the results CSV file
-            csv_files = list(evaluation_folder.glob('*-results.csv'))
+            # Find the results CSV file (exclude frame-level results)
+            csv_files = [f for f in evaluation_folder.glob('*-results.csv')
+                        if 'frame-level' not in f.name]
             if not csv_files:
                 raise FileNotFoundError(f"No evaluation CSV file found in {evaluation_folder}")
 
