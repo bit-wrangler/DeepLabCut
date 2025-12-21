@@ -126,7 +126,8 @@ def run_single_fold(args):
             autotune=False,
             displayiters=100,
             saveiters=5000,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            epochs=N_EPOCHS,
             )
 
         # d. Evaluate the trained network on the held-out test set
