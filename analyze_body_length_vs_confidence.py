@@ -15,10 +15,11 @@ The script will:
     - Calculate body length (SVL) from snout and tail1 positions
     - Calculate prediction errors (absolute and relative)
     - Calculate confidence metrics (arithmetic mean, harmonic mean, and min)
-    - Generate three plots:
+    - Generate four plots:
         1. Scatter plot: Error vs arithmetic mean confidence
         2. Scatter plot: Error vs harmonic mean confidence
-        3. Histogram: Error distributions by confidence cutoffs (≥0.95, ≥0.9, ≥0.8, ≥0.5)
+        3. Histogram (counts): Error distributions by confidence cutoffs (≥0.95, ≥0.9, ≥0.8, ≥0.5)
+        4. Histogram (density): Normalized error distributions for better comparison
     - Optionally save computed metrics to CSV
 
 Note: Harmonic mean is more sensitive to low confidence values than arithmetic mean,
@@ -451,6 +452,92 @@ def generate_error_distribution_histogram(df, experiment_id, landmark_set_name, 
             print(f"  Conf ≥ {cutoff}: No data")
 
 
+def generate_error_distribution_histogram_density(df, experiment_id, landmark_set_name, output_dir, plot_settings):
+    """
+    Create histogram showing relative error distributions for different confidence cutoffs.
+    Uses density (normalized) instead of counts for better comparison across different sample sizes.
+
+    Args:
+        df: DataFrame with computed metrics
+        experiment_id: Experiment identifier
+        landmark_set_name: Landmark set name
+        output_dir: Directory to save plot
+        plot_settings: Dictionary with plot configuration
+    """
+    if len(df) == 0:
+        print("Warning: No data to plot. Skipping density histogram generation.")
+        return
+
+    # Define confidence cutoffs
+    cutoffs = [0.95, 0.9, 0.8, 0.5]
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']  # Blue, orange, green, red
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=plot_settings['figsize'])
+
+    # Determine bin edges for consistent binning across all distributions
+    # Use relative error in percentage
+    max_error = min(df['relative_error'].max() * 100, 100)  # Cap at 100%
+    n_bins = 25
+    bins = np.linspace(0, max_error, n_bins + 1)
+    bin_width = bins[1] - bins[0]
+
+    # Calculate width for each bar (divide bin width by number of cutoffs)
+    n_cutoffs = len(cutoffs)
+    bar_width = bin_width / n_cutoffs
+
+    # Plot histogram for each cutoff with offset positions
+    for i, (cutoff, color) in enumerate(zip(cutoffs, colors)):
+        # Filter data by confidence cutoff
+        df_cutoff = df[df['mean_confidence'] >= cutoff]
+
+        if len(df_cutoff) > 0:
+            # Convert relative error to percentage
+            errors_pct = df_cutoff['relative_error'] * 100
+
+            # Compute histogram
+            counts, _ = np.histogram(errors_pct, bins=bins)
+
+            # Normalize to density (sum to 1)
+            density = counts / counts.sum()
+
+            # Calculate bar positions (offset for side-by-side display)
+            # Center the group of bars within each bin
+            offset = (i - (n_cutoffs - 1) / 2) * bar_width
+            bar_positions = bins[:-1] + bin_width / 2 + offset
+
+            # Plot bars
+            ax.bar(bar_positions, density, width=bar_width * 0.9, color=color,
+                   label=f'Conf ≥ {cutoff} (n={len(df_cutoff)})',
+                   edgecolor='black', linewidth=0.5, alpha=0.8)
+
+    # Set labels and title
+    ax.set_xlabel('Relative Error (%)', fontsize=12)
+    ax.set_ylabel('Density (Normalized Frequency)', fontsize=12)
+    ax.set_title(f'Error Distribution by Confidence Cutoff (Density): {experiment_id} ({landmark_set_name})',
+                fontsize=14, fontweight='bold')
+
+    # Add legend
+    ax.legend(loc='upper right', fontsize=10)
+
+    # Add grid
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Set x-axis limits
+    ax.set_xlim(0, max_error)
+
+    # Tight layout
+    plt.tight_layout()
+
+    # Save plot
+    output_filename = f'body_length_error_distribution_density_{experiment_id}_{landmark_set_name}.png'
+    output_path = os.path.join(output_dir, output_filename)
+    plt.savefig(output_path, dpi=plot_settings['dpi'], bbox_inches='tight')
+    plt.close()
+
+    print(f"Error distribution density histogram saved to: {output_filename}")
+
+
 def save_computed_metrics(df, experiment_id, landmark_set_name, output_dir):
     """
     Save DataFrame with computed metrics to CSV file.
@@ -610,10 +697,15 @@ def main():
     generate_harmonic_mean_plot(df_filtered, EXPERIMENT_ID, LANDMARK_SET_NAME,
                                 OUTPUT_DIR, plot_settings)
 
-    # Plot 3: Error distribution histogram by confidence cutoffs
-    print("3. Generating error distribution histogram by confidence cutoffs...")
+    # Plot 3: Error distribution histogram by confidence cutoffs (counts)
+    print("3. Generating error distribution histogram by confidence cutoffs (counts)...")
     generate_error_distribution_histogram(df_filtered, EXPERIMENT_ID, LANDMARK_SET_NAME,
                                          OUTPUT_DIR, plot_settings)
+
+    # Plot 4: Error distribution histogram by confidence cutoffs (density)
+    print("4. Generating error distribution histogram by confidence cutoffs (density)...")
+    generate_error_distribution_histogram_density(df_filtered, EXPERIMENT_ID, LANDMARK_SET_NAME,
+                                                  OUTPUT_DIR, plot_settings)
 
     # 9. Optionally save computed metrics
     if SAVE_COMPUTED_METRICS:
