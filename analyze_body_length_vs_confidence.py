@@ -9,14 +9,19 @@ showing the relationship between prediction error and confidence scores.
 Usage:
     1. Update the configuration constants at the top of this file
     2. Run: python analyze_body_length_vs_confidence.py
-    
+
 The script will:
     - Load frame-level aggregate CSV file (from User Story 02)
     - Calculate body length (SVL) from snout and tail1 positions
     - Calculate prediction errors (absolute and relative)
-    - Calculate confidence metrics (mean and min)
-    - Generate scatter plot of error vs confidence
+    - Calculate confidence metrics (arithmetic mean, harmonic mean, and min)
+    - Generate two scatter plots:
+        1. Error vs arithmetic mean confidence
+        2. Error vs harmonic mean confidence
     - Optionally save computed metrics to CSV
+
+Note: Harmonic mean is more sensitive to low confidence values than arithmetic mean,
+      making it useful for identifying cases where one bodypart has low confidence.
 """
 
 import pandas as pd
@@ -156,12 +161,20 @@ def calculate_confidence_metrics(df, bodypart_1, bodypart_2):
         pd.DataFrame: DataFrame with added columns:
             - mean_confidence: Mean of bodypart_1 and bodypart_2 confidence
             - min_confidence: Minimum of bodypart_1 and bodypart_2 confidence
+            - harmonic_mean_confidence: Harmonic mean of bodypart_1 and bodypart_2 confidence
     """
-    # Calculate mean confidence
+    # Calculate mean confidence (arithmetic mean)
     df['mean_confidence'] = (df[f'conf_{bodypart_1}'] + df[f'conf_{bodypart_2}']) / 2
 
     # Calculate minimum confidence
     df['min_confidence'] = df[[f'conf_{bodypart_1}', f'conf_{bodypart_2}']].min(axis=1)
+
+    # Calculate harmonic mean confidence
+    # Formula: 2 / (1/c1 + 1/c2) = 2 * c1 * c2 / (c1 + c2)
+    # Harmonic mean is more sensitive to low values than arithmetic mean
+    conf_1 = df[f'conf_{bodypart_1}']
+    conf_2 = df[f'conf_{bodypart_2}']
+    df['harmonic_mean_confidence'] = 2 * conf_1 * conf_2 / (conf_1 + conf_2)
 
     return df
 
@@ -190,7 +203,7 @@ def filter_valid_data(df, min_body_length, confidence_threshold):
 
     # Drop rows with NaN values in critical columns
     critical_cols = ['true_body_length', 'pred_body_length', 'relative_error',
-                     'mean_confidence', 'min_confidence']
+                     'mean_confidence', 'min_confidence', 'harmonic_mean_confidence']
     df_filtered = df_filtered.dropna(subset=critical_cols)
     nan_count = initial_count - small_body_length_count - low_confidence_count - len(df_filtered)
 
@@ -275,6 +288,72 @@ def generate_scatter_plot(df, experiment_id, landmark_set_name, output_dir, plot
     print(f"Plot saved to: {output_filename}")
 
 
+def generate_harmonic_mean_plot(df, experiment_id, landmark_set_name, output_dir, plot_settings):
+    """
+    Create and save scatter plot with harmonic mean confidence.
+
+    Args:
+        df: DataFrame with computed metrics
+        experiment_id: Experiment identifier
+        landmark_set_name: Landmark set name
+        output_dir: Directory to save plot
+        plot_settings: Dictionary with plot configuration
+    """
+    if len(df) == 0:
+        print("Warning: No data to plot. Skipping harmonic mean plot generation.")
+        return
+
+    # Create figure
+    plt.figure(figsize=plot_settings['figsize'])
+
+    # Cap relative error for visualization if specified
+    relative_error_display = df['relative_error'].copy()
+    if plot_settings['max_error'] is not None:
+        relative_error_display = relative_error_display.clip(upper=plot_settings['max_error'])
+
+    # Create scatter plot (convert relative error to percentage)
+    plt.scatter(df['harmonic_mean_confidence'],
+                relative_error_display * 100,
+                alpha=plot_settings['alpha'],
+                s=20,
+                edgecolors='none')
+
+    # Set axis labels
+    plt.xlabel('Harmonic Mean Confidence Score', fontsize=12)
+    plt.ylabel('Relative Error (%)', fontsize=12)
+
+    # Set title
+    plt.title(f'Body Length Error vs Harmonic Mean Confidence: {experiment_id} ({landmark_set_name})',
+              fontsize=14, fontweight='bold')
+
+    # Add grid
+    plt.grid(True, alpha=0.3)
+
+    # Add reference lines
+    # Horizontal lines for error thresholds
+    for error_threshold in [5, 10, 20]:
+        plt.axhline(y=error_threshold, color='red', linestyle='--', alpha=0.3, linewidth=1)
+
+    # Vertical lines for confidence thresholds
+    for conf_threshold in [0.5, 0.7, 0.9]:
+        plt.axvline(x=conf_threshold, color='blue', linestyle='--', alpha=0.3, linewidth=1)
+
+    # Set axis limits
+    plt.xlim(0, 1.0)
+    plt.ylim(0, max(100, relative_error_display.max() * 100 * 1.1))
+
+    # Tight layout
+    plt.tight_layout()
+
+    # Save plot
+    output_filename = f'body_length_error_vs_harmonic_confidence_{experiment_id}_{landmark_set_name}.png'
+    output_path = os.path.join(output_dir, output_filename)
+    plt.savefig(output_path, dpi=plot_settings['dpi'], bbox_inches='tight')
+    plt.close()
+
+    print(f"Harmonic mean plot saved to: {output_filename}")
+
+
 def save_computed_metrics(df, experiment_id, landmark_set_name, output_dir):
     """
     Save DataFrame with computed metrics to CSV file.
@@ -332,11 +411,16 @@ def print_summary_statistics(df, df_filtered):
 
     # Confidence statistics
     print(f"\nConfidence Statistics:")
-    print(f"  Mean confidence:")
+    print(f"  Mean confidence (arithmetic):")
     print(f"    Mean: {df_filtered['mean_confidence'].mean():.4f}")
     print(f"    Std:  {df_filtered['mean_confidence'].std():.4f}")
     print(f"    Min:  {df_filtered['mean_confidence'].min():.4f}")
     print(f"    Max:  {df_filtered['mean_confidence'].max():.4f}")
+    print(f"  Harmonic mean confidence:")
+    print(f"    Mean: {df_filtered['harmonic_mean_confidence'].mean():.4f}")
+    print(f"    Std:  {df_filtered['harmonic_mean_confidence'].std():.4f}")
+    print(f"    Min:  {df_filtered['harmonic_mean_confidence'].min():.4f}")
+    print(f"    Max:  {df_filtered['harmonic_mean_confidence'].max():.4f}")
     print(f"  Min confidence:")
     print(f"    Mean: {df_filtered['min_confidence'].mean():.4f}")
     print(f"    Std:  {df_filtered['min_confidence'].std():.4f}")
@@ -344,8 +428,11 @@ def print_summary_statistics(df, df_filtered):
     print(f"    Max:  {df_filtered['min_confidence'].max():.4f}")
 
     # Correlation between confidence and error
-    correlation = df_filtered['mean_confidence'].corr(df_filtered['relative_error'])
-    print(f"\nCorrelation (mean_confidence vs relative_error): {correlation:.4f}")
+    correlation_mean = df_filtered['mean_confidence'].corr(df_filtered['relative_error'])
+    correlation_harmonic = df_filtered['harmonic_mean_confidence'].corr(df_filtered['relative_error'])
+    print(f"\nCorrelation with relative_error:")
+    print(f"  Mean confidence (arithmetic): {correlation_mean:.4f}")
+    print(f"  Harmonic mean confidence:     {correlation_harmonic:.4f}")
 
     # Error distribution by confidence bins
     print(f"\nError by Confidence Bins:")
@@ -406,17 +493,25 @@ def main():
     # 7. Print summary statistics
     print_summary_statistics(df, df_filtered)
 
-    # 8. Generate scatter plot
+    # 8. Generate scatter plots
     print(f"\n{'='*60}")
-    print("Generating scatter plot...")
+    print("Generating scatter plots...")
     plot_settings = {
         'figsize': PLOT_FIGSIZE,
         'alpha': PLOT_ALPHA,
         'dpi': PLOT_DPI,
         'max_error': MAX_RELATIVE_ERROR_DISPLAY
     }
+
+    # Plot 1: Mean confidence (arithmetic mean)
+    print("\n1. Generating plot with arithmetic mean confidence...")
     generate_scatter_plot(df_filtered, EXPERIMENT_ID, LANDMARK_SET_NAME,
                          OUTPUT_DIR, plot_settings)
+
+    # Plot 2: Harmonic mean confidence
+    print("2. Generating plot with harmonic mean confidence...")
+    generate_harmonic_mean_plot(df_filtered, EXPERIMENT_ID, LANDMARK_SET_NAME,
+                                OUTPUT_DIR, plot_settings)
 
     # 9. Optionally save computed metrics
     if SAVE_COMPUTED_METRICS:
