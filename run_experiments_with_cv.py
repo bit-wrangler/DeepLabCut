@@ -600,4 +600,7 @@ if __name__ == "__main__":
     all_results.append(results)
         
     all_results_df = pd.concat(all_results)
-    all_results_df.to_csv(f'all_results_{timestamp}.csv')
+    if ("result_filename" in exp_cfg):
+        all_results_df.to_csv(f'{exp_cfg["result_filename"]}_{timestamp}.csv')
+    else:
+        all_results_df.to_csv(f'all_results_{timestamp}.csv')
