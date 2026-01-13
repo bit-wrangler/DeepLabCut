@@ -15,6 +15,7 @@ DATA_ARCHIVE={{DATA_ARCHIVE_PLACEHOLDER}}
 EXPERIMENT_CONFIG_FILE={{CONFIG_FILE_PLACEHOLDER}}
 APPTAINER_PATH={{APPTAINER_PATH_PLACEHOLDER}}
 CODE_BRANCH={{CODE_BRANCH_PLACEHOLDER}}
+RESULTS_DIR={{RESULTS_DIR_PLACEHOLDER}}
 
 WORKDIR=/tmp/dlc_project
 CODEDIR=/tmp/DeepLabCut
@@ -27,17 +28,23 @@ mkdir -p $WORKDIR/training-datasets
 mkdir -p $WORKDIR/videos
 mkdir -p $WORKDIR/processed
 
-## Extract project files from archive
+## Extract project files from archive and shift labelled data and config.yaml upwards
 unzip -q $DATA_ARCHIVE -d $WORKDIR
-
+mv $WORKDIR/data_archive/labeled-data $WORKDIR
+mv $WORKDIR/data_archive/dlc-models-pytorch $WORKDIR
+mv $WORKDIR/data_archive/training-datasets $WORKDIR
+mv $WORKDIR/data_archive/config.yaml $WORKDIR
 ## Clone DLC
-git clone https://github.com/bit-wrangler/DeepLabCut.git $CODEDIR
+#git clone https://github.com/bit-wrangler/DeepLabCut.git $CODEDIR
+#cd $CODEDIR
+#git checkout $CODE_BRANCH
+cp -r ~/scratch/dlc-experiments/DeepLabCut /tmp/
+
 cd $CODEDIR
-git checkout $CODE_BRANCH
-
 ## Copy config file to working directory
-cp $EXPERIMENT_CONFIG_FILE $WORKDIR/experiment_config.yaml
-
+cp $EXPERIMENT_CONFIG_FILE $WORKDIR/experiment_cfg.yaml
+echo $WORKDIR 
+ls $WORKDIR
 ## Run experiment via apptainer
 apptainer exec --nv \
   --bind "$CODEDIR":/workspace/DeepLabCut \
@@ -46,6 +53,8 @@ apptainer exec --nv \
   "$APPTAINER_PATH" \
   bash -lc '
     export PYTHONPATH=/workspace/DeepLabCut:$PYTHONPATH
-    python run_experiments_with_cv.py
+    python run_experiments_with_cv.py /workspace/workdir/experiment_cfg.yaml
+    find /workspace/
   '
 
+cp $CODEDIR/all_results_*.csv $RESULTS_DIR/

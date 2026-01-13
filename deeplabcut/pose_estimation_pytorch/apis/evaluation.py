@@ -105,6 +105,69 @@ def predict(
     }
 
 
+def create_frame_level_results_pytorch(
+    ground_truth: dict[str, np.ndarray],
+    predictions: dict[str, np.ndarray],
+    bodyparts: list[str],
+    image_paths: list[str],
+) -> pd.DataFrame:
+    """
+    Creates a frame-level results DataFrame for test set evaluation.
+
+    This function generates a CSV-friendly DataFrame containing ground truth positions,
+    predicted positions, and confidence scores for each bodypart in each test frame.
+
+    Args:
+        ground_truth: Dict mapping image paths to GT arrays of shape
+            [n_individuals, n_bodyparts, 3] where last dimension is [x, y, visibility]
+        predictions: Dict mapping image paths to prediction arrays of shape
+            [n_individuals, n_bodyparts, 3] where last dimension is [x, y, confidence]
+        bodyparts: List of bodypart names in order
+        image_paths: List of image paths (for consistent ordering)
+
+    Returns:
+        DataFrame with columns: frame_index, image_path, gt_{bodypart}_x,
+        gt_{bodypart}_y, pred_{bodypart}_x, pred_{bodypart}_y, conf_{bodypart}
+        for each bodypart. Contains only test set frames.
+    """
+    # Build column names
+    columns = ["frame_index", "image_path"]
+    for bp in bodyparts:
+        columns.extend(
+            [f"gt_{bp}_x", f"gt_{bp}_y", f"pred_{bp}_x", f"pred_{bp}_y", f"conf_{bp}"]
+        )
+
+    # Build rows
+    rows = []
+    for idx, image_path in enumerate(image_paths):
+        row = [idx, image_path]
+
+        # Get arrays for this image (single animal: use index 0)
+        # If image not in dict, use NaN array
+        gt_array = ground_truth.get(
+            image_path, np.full((1, len(bodyparts), 3), np.nan)
+        )
+        pred_array = predictions.get(
+            image_path, np.full((1, len(bodyparts), 3), np.nan)
+        )
+
+        for bp_idx, bp in enumerate(bodyparts):
+            # Ground truth (x, y) - for single animal, use individual index 0
+            gt_x = gt_array[0, bp_idx, 0]
+            gt_y = gt_array[0, bp_idx, 1]
+
+            # Predictions (x, y, confidence) - for single animal, use individual index 0
+            pred_x = pred_array[0, bp_idx, 0]
+            pred_y = pred_array[0, bp_idx, 1]
+            conf = pred_array[0, bp_idx, 2]
+
+            row.extend([gt_x, gt_y, pred_x, pred_y, conf])
+
+        rows.append(row)
+
+    return pd.DataFrame(rows, columns=columns)
+
+
 def evaluate(
     pose_runner: InferenceRunner,
     loader: Loader,
@@ -478,6 +541,7 @@ def evaluate_snapshot(
     per_keypoint_evaluation: bool = False,
     detector_snapshot: Snapshot | None = None,
     pcutoff: float | list[float] | dict[str, float] | None = None,
+    save_frame_level_results: bool = True,
 ) -> pd.DataFrame:
     """Evaluates a snapshot.
     The evaluation results are stored in the .h5 and .csv file under the subdirectory
@@ -507,6 +571,10 @@ def evaluate_snapshot(
             (if there are any). If a dict is provided, the keys should be bodyparts
             mapping to pcutoff values for each bodypart. Bodyparts that are not defined
             in the dict will have pcutoff set to 0.6.
+        save_frame_level_results: Save frame-by-frame ground truth, predictions, and
+            confidence scores to a CSV file named {model_name}-frame-level-results.csv
+            in the evaluation-results-pytorch folder. The CSV contains detailed data for
+            each frame in the test set only.
     """
     head_type = loader.model_cfg["model"]["heads"]["bodypart"]["type"]
     if head_type == "DLCRNetHead":
@@ -566,6 +634,7 @@ def evaluate_snapshot(
     predictions = {}
     rmse_per_bodypart = {}
     bounding_boxes = {}
+    raw_predictions = {}  # Store raw predictions for frame-level CSV
     scores = {
         "%Training dataset": loader.train_fraction,
         "Shuffle number": loader.shuffle,
@@ -609,6 +678,7 @@ def evaluate_snapshot(
         )
         predictions[split] = df_split_predictions
         bounding_boxes[split] = split_bounding_boxes
+        raw_predictions[split] = predictions_for_split  # Store raw predictions
         for k, v in results.items():
             scores[f"{split} {k}"] = round(v, 2)
 
@@ -638,6 +708,32 @@ def evaluate_snapshot(
             output_filename.stem + "-keypoint-results.csv"
         )
         save_rmse_per_bodypart(rmse_per_bodypart, rmse_per_bpt_path, show_errors)
+
+    # Save frame-level results CSV
+    if save_frame_level_results:
+        # Get test set ground truth and predictions
+        gt_test = loader.ground_truth_keypoints("test")
+        pred_test = {
+            img: pred["bodyparts"]
+            for img, pred in raw_predictions["test"].items()
+            if img in gt_test
+        }
+
+        # Get ordered list of test image paths
+        test_image_paths = list(gt_test.keys())
+
+        df_frame_level = create_frame_level_results_pytorch(
+            ground_truth=gt_test,
+            predictions=pred_test,
+            bodyparts=eval_parameters.bodyparts,
+            image_paths=test_image_paths,
+        )
+
+        frame_level_path = output_filename.with_name(
+            output_filename.stem + "-frame-level-results.csv"
+        )
+        df_frame_level.to_csv(frame_level_path, index=False)
+        print(f"Frame-level results saved to: {frame_level_path.name}")
 
     if plotting:
         folder_name = f"LabeledImages_{scorer}"
@@ -697,6 +793,7 @@ def evaluate_network(
     modelprefix: str = "",
     detector_snapshot_index: int | None = None,
     pcutoff: float | list[float] | dict[str, float] | None = None,
+    save_frame_level_results: bool = True,
 ) -> None:
     """Evaluates a snapshot.
 
@@ -740,6 +837,10 @@ def evaluate_network(
             (if there are any). If a dict is provided, the keys should be bodyparts
             mapping to pcutoff values for each bodypart. Bodyparts that are not defined
             in the dict will have pcutoff set to 0.6.
+        save_frame_level_results: Save frame-by-frame ground truth, predictions, and
+            confidence scores to a CSV file named {model_name}-frame-level-results.csv
+            in the evaluation-results-pytorch folder. The CSV contains detailed data for
+            each frame in the test set only.
 
     Examples:
         If you want to evaluate on shuffle 1 without plotting predictions.
@@ -847,6 +948,7 @@ def evaluate_network(
                         per_keypoint_evaluation=per_keypoint_evaluation,
                         detector_snapshot=detector_snapshot,
                         pcutoff=pcutoff,
+                        save_frame_level_results=save_frame_level_results,
                     )
 
 

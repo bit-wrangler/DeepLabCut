@@ -11,15 +11,17 @@ from deeplabcut.generate_training_dataset.trainingsetmanipulation import merge_a
 import shutil
 import datetime
 import multiprocessing as mp
-
+import sys
+import json
+from ruamel.yaml import YAML
 
 # Number of parallel workers for running fold+seed combinations
 # Set to 1 for sequential execution (useful for debugging)
 # Set to higher values (e.g., 4, 8) to run multiple experiments in parallel
 # Note: Each worker will use GPU resources, so adjust based on available GPU memory
-N_WORKERS = 2
+N_WORKERS = 1
 
-N_EPOCHS = 200
+N_EPOCHS = 1
 MODEL = 'resnet_50'
 OUTPUT_STRIDE = 16
 KEY_METRIC = 'test.rmse' #'test.mAP'
@@ -30,7 +32,7 @@ TRAIN_BATCH_SIZE = 16
 # ---------------------------------------
 # Set the full path to the project's config.yaml file
 # IMPORTANT: Use an absolute path to avoid issues.
-config_path = '/home/alek/projects/cdl-test1/data/cdl-projects/test1-haag-2025-05-21/config_full.yaml'
+config_path = '/workspace/workdir/config.yaml'
 
 # Check if the config file exists
 if not os.path.exists(config_path):
@@ -60,7 +62,7 @@ def run_single_fold(args):
     """Run a single fold+seed combination. This function is designed to be run in parallel."""
     (seed_idx, fold_idx, train_indices, test_indices, config_path_template,
      experiment_id, group_by_video, train_overrides, landmark_sets,
-     n_folds, n_seeds, num_frames, timestamp) = args
+     n_folds, n_seeds, num_frames, timestamp, epochs) = args
 
     # Create a unique config file for this fold+seed combination
     config_dir = Path(config_path_template).parent
@@ -126,6 +128,10 @@ def run_single_fold(args):
         # c. Train the network for this fold
         print(f"  Training network for shuffle {shuffle_num}...")
         # Adjust training parameters (e.g., maxiters) as needed.
+
+
+
+
         deeplabcut.train_network(
             config_path,
             shuffle=shuffle_num,
@@ -133,7 +139,8 @@ def run_single_fold(args):
             autotune=False,
             displayiters=100,
             saveiters=5000,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            epochs=epochs
             )
 
         # d. Evaluate the trained network on the held-out test set
@@ -144,14 +151,16 @@ def run_single_fold(args):
             engine_name = deeplabcut.compat.get_project_engine(cfg).aliases[0]
             trainingset_identifier = f"{cfg['Task']}{cfg['date']}-trainset{train_fraction_percent}shuffle{shuffle_num}"
             evaluation_folder = Path(project_path) / f"evaluation-results-{engine_name}" / f"iteration-{iteration}" / trainingset_identifier
+
+            print (f"The evaluation folder is: {evaluation_folder}")
             # recursively delete evaluation folder contents, but not the folder itself
             if evaluation_folder.exists():
+                
                 for child in evaluation_folder.glob('*'):
                     if child.is_file():
                         child.unlink()
                     else:
                         shutil.rmtree(child)
-
 
             deeplabcut.evaluate_network(config_path, Shuffles=[shuffle_num], plotting=False, comparisonbodyparts=landmark_set)
 
@@ -189,8 +198,13 @@ def run_single_fold(args):
                     evaluation_results.update(summary_dict)
             else:
                 raise ValueError("Evaluation CSV file is empty.")
-
-        return evaluation_resFalseults
+        
+        #evaluation_results = {
+        #    'field1': ['value1', 'value2', 'value3'],
+        #    'field2': [1, 2, 3],
+        #    'field3': [True, False, True]
+        #}
+        return evaluation_results
 
     finally:
         # Clean up the temporary config file
@@ -200,7 +214,7 @@ def run_single_fold(args):
 
 
 
-def run_experiment(config_path, n_folds, n_seeds, experiment_id='experiment_1', group_by_video=False, train_overrides={}, landmark_sets={'all': 'all'}):
+def run_experiment(config_path, exp_cfg, landmark_sets={'all': 'all'}):
     """Run cross-validation experiment with parallel processing of folds and seeds."""
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     cfg = deeplabcut.auxiliaryfunctions.read_config(config_path)
@@ -210,12 +224,24 @@ def run_experiment(config_path, n_folds, n_seeds, experiment_id='experiment_1', 
                 cfg,
                 Path(os.path.join(project_path, trainingsetfolder)),
             )
+
+    n_folds = exp_cfg["n_folds"]
+    fold_idx = exp_cfg["fold_idx"]
+    n_seeds = exp_cfg["n_seeds"]
+    seed_idx = exp_cfg["seed_idx"]
+    seed_offset = exp_cfg["seed_offset"]
+    experiment_id = exp_cfg["experiment_id"]
+    group_by_video = exp_cfg["group_by_video"]
+    epochs = exp_cfg["epochs"]
+    train_overrides = exp_cfg["train_overrides"]
+
     groups = np.array(list(map(lambda x: x[1], Data.axes[0])))
     num_frames = len(Data)
     print(f"Total number of labeled frames: {num_frames}")
 
     # Prepare all fold+seed combinations
     all_tasks = []
+    """
     for i in range(n_seeds):
         print(f"\n\n{'='*20} Preparing SEED {i+1}/{n_seeds} {'='*20}")
 
@@ -250,6 +276,41 @@ def run_experiment(config_path, n_folds, n_seeds, experiment_id='experiment_1', 
                 timestamp
             )
             all_tasks.append(task_args)
+    """
+    if group_by_video:
+        # Note: GroupKFold doesn't support random_state directly, so we shuffle groups manually
+        unique_groups = np.unique(groups)
+        rng = np.random.RandomState(42 + seed_idx)
+        shuffled_group_order = rng.permutation(unique_groups)
+        # Create a mapping from old group to new group based on shuffled order
+        group_mapping = {old_g: new_g for new_g, old_g in enumerate(shuffled_group_order)}
+        shuffled_groups = np.array([group_mapping[g] for g in groups])
+        cv = GroupKFold(n_splits=n_folds)
+        folds = list(cv.split(np.arange(num_frames), groups=shuffled_groups))
+    else:
+        cv = KFold(n_splits=n_folds, random_state=42+seed_idx, shuffle=True)
+        folds = list(cv.split(np.arange(num_frames)))
+
+    
+    
+    train_indices, test_indices = folds[fold_idx]
+    task_args = (
+        seed_idx,
+        fold_idx,
+        train_indices,
+        test_indices,
+        config_path,  # config_path_template
+        experiment_id,
+        group_by_video,
+        train_overrides,
+        landmark_sets,
+        n_folds,
+        n_seeds,
+        num_frames,
+        timestamp,
+        epochs
+    )
+    all_tasks.append(task_args)
 
     print(f"\n\n{'='*20} Running {len(all_tasks)} tasks with {N_WORKERS} workers {'='*20}")
 
@@ -260,7 +321,7 @@ def run_experiment(config_path, n_folds, n_seeds, experiment_id='experiment_1', 
     else:
         # Sequential execution for debugging
         evaluation_results_list = [run_single_fold(task) for task in all_tasks]
-
+    print (f"Evaluation Results Contents is : {evaluation_results_list}")
     # 5. AGGREGATE AND REPORT FINAL RESULTS
     # ------------------------------------
     print(f"\n\n{'='*20} Cross-Validation Summary {'='*20}")
@@ -518,21 +579,28 @@ if __name__ == "__main__":
     ]
 
     all_results = []
+    config_filename = sys.argv[1]
 
+    exp_cfg = None
+    with open(config_filename, "r") as f:        
+        exp_cfg = YAML(typ="safe",pure=True).load(f)
+
+    """
     for experiment in experiments:
-        results: pd.DataFrame = run_experiment(
-            config_path, 
-            N_FOLDS, 
-            N_SEEDS, 
-            experiment['experiment_id'],
-            group_by_video=experiment['group_by_video'], 
-            train_overrides=experiment['train_overrides'], 
-            landmark_sets=landmark_sets
-        )
-
         result_timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         results.to_csv(f'results_{result_timestamp}_{uuid.uuid4()}.csv')
         all_results.append(results)
+    """
+    results: pd.DataFrame = run_experiment(
+            config_path, 
+            exp_cfg,
+            landmark_sets=landmark_sets
+        )
 
+    all_results.append(results)
+        
     all_results_df = pd.concat(all_results)
-    all_results_df.to_csv(f'all_results_{timestamp}.csv')
+    if ("result_filename" in exp_cfg):
+        all_results_df.to_csv(f'{exp_cfg["result_filename"]}_{timestamp}.csv')
+    else:
+        all_results_df.to_csv(f'all_results_{timestamp}.csv')
