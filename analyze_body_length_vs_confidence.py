@@ -49,7 +49,7 @@ CONFIDENCE_THRESHOLD = 0.0          # Minimum confidence to include (0.0 = inclu
 
 # Visualization settings
 PLOT_DPI = 300                      # Plot resolution
-PLOT_FIGSIZE = (10, 8)              # Figure size in inches
+PLOT_FIGSIZE = (4, 3)              # Figure size in inches
 PLOT_ALPHA = 0.5                    # Point transparency
 MAX_RELATIVE_ERROR_DISPLAY = 1.0   # Cap relative error at 100% for visualization
 
@@ -141,11 +141,13 @@ def calculate_body_length_metrics(df, bodypart_1, bodypart_2):
     )
 
     # Calculate absolute error
-    df['absolute_error'] = np.abs(df['pred_body_length'] - df['true_body_length'])
+    df['error'] = df['pred_body_length'] - df['true_body_length']
+    df['absolute_error'] = np.abs(df['error'])
 
     # Calculate relative error (as decimal, e.g., 0.05 = 5%)
     # Avoid division by zero - will result in NaN which we'll filter later
-    df['relative_error'] = df['absolute_error'] / df['true_body_length']
+    df['relative_error'] = df['error'] / df['true_body_length']
+    df['relative_error_absolute'] = df['absolute_error'] / df['true_body_length']
 
     return df
 
@@ -204,7 +206,7 @@ def filter_valid_data(df, min_body_length, confidence_threshold):
     low_confidence_count = initial_count - small_body_length_count - len(df_filtered)
 
     # Drop rows with NaN values in critical columns
-    critical_cols = ['true_body_length', 'pred_body_length', 'relative_error',
+    critical_cols = ['true_body_length', 'pred_body_length', 'relative_error', 'relative_error_absolute',
                      'mean_confidence', 'min_confidence', 'harmonic_mean_confidence']
     df_filtered = df_filtered.dropna(subset=critical_cols)
     nan_count = initial_count - small_body_length_count - low_confidence_count - len(df_filtered)
@@ -276,7 +278,7 @@ def generate_scatter_plot(df, experiment_id, landmark_set_name, output_dir, plot
 
     # Set axis limits
     plt.xlim(0, 1.0)
-    plt.ylim(0, max(100, relative_error_display.max() * 100 * 1.1))
+    plt.ylim(min(relative_error_display.min() * 100 * 1.1, -100), max(100, relative_error_display.max() * 100 * 1.1))
 
     # Tight layout
     plt.tight_layout()
@@ -342,7 +344,7 @@ def generate_harmonic_mean_plot(df, experiment_id, landmark_set_name, output_dir
 
     # Set axis limits
     plt.xlim(0, 1.0)
-    plt.ylim(0, max(100, relative_error_display.max() * 100 * 1.1))
+    plt.ylim(min(relative_error_display.min() * 100 * 1.1, -100), max(100, relative_error_display.max() * 100 * 1.1))
 
     # Tight layout
     plt.tight_layout()
@@ -373,7 +375,7 @@ def generate_error_distribution_histogram(df, experiment_id, landmark_set_name, 
         return
 
     # Define confidence cutoffs
-    cutoffs = [0.95, 0.9, 0.8, 0.5]
+    cutoffs = [0.9, 0.7, 0.5,0.]
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']  # Blue, orange, green, red
 
     # Create figure
@@ -382,8 +384,9 @@ def generate_error_distribution_histogram(df, experiment_id, landmark_set_name, 
     # Determine bin edges for consistent binning across all distributions
     # Use relative error in percentage
     max_error = min(df['relative_error'].max() * 100, 100)  # Cap at 100%
+    min_error = max(df['relative_error'].min() * 100, -100)  # Cap at -100%
     n_bins = 25
-    bins = np.linspace(0, max_error, n_bins + 1)
+    bins = np.linspace(min_error, max_error, n_bins + 1)
     bin_width = bins[1] - bins[0]
 
     # Calculate width for each bar (divide bin width by number of cutoffs)
@@ -393,11 +396,12 @@ def generate_error_distribution_histogram(df, experiment_id, landmark_set_name, 
     # Plot histogram for each cutoff with offset positions
     for i, (cutoff, color) in enumerate(zip(cutoffs, colors)):
         # Filter data by confidence cutoff
-        df_cutoff = df[df['mean_confidence'] >= cutoff]
+        # df_cutoff = df[df['mean_confidence'] >= cutoff]
+        df_cutoff = df[df['harmonic_mean_confidence'] >= cutoff]
 
         if len(df_cutoff) > 0:
             # Convert relative error to percentage
-            errors_pct = df_cutoff['relative_error'] * 100
+            errors_pct = np.clip(df_cutoff['relative_error'] * 100, min_error, max_error)
 
             # Compute histogram
             counts, _ = np.histogram(errors_pct, bins=bins)
@@ -415,7 +419,7 @@ def generate_error_distribution_histogram(df, experiment_id, landmark_set_name, 
     # Set labels and title
     ax.set_xlabel('Relative Error (%)', fontsize=12)
     ax.set_ylabel('Frequency', fontsize=12)
-    ax.set_title(f'Error Distribution by Confidence Cutoff: {experiment_id} ({landmark_set_name})',
+    ax.set_title(f'Error Distribution by \nConfidence Cutoff: {experiment_id} ({landmark_set_name})',
                 fontsize=14, fontweight='bold')
 
     # Add legend
@@ -425,7 +429,7 @@ def generate_error_distribution_histogram(df, experiment_id, landmark_set_name, 
     ax.grid(True, alpha=0.3, axis='y')
 
     # Set x-axis limits
-    ax.set_xlim(0, max_error)
+    ax.set_xlim(min_error, max_error)
 
     # Tight layout
     plt.tight_layout()
@@ -469,7 +473,7 @@ def generate_error_distribution_histogram_density(df, experiment_id, landmark_se
         return
 
     # Define confidence cutoffs
-    cutoffs = [0.95, 0.9, 0.8, 0.5]
+    cutoffs = [0.9, 0.7, 0.5,0.]
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']  # Blue, orange, green, red
 
     # Create figure
@@ -478,8 +482,9 @@ def generate_error_distribution_histogram_density(df, experiment_id, landmark_se
     # Determine bin edges for consistent binning across all distributions
     # Use relative error in percentage
     max_error = min(df['relative_error'].max() * 100, 100)  # Cap at 100%
+    min_error = max(df['relative_error'].min() * 100, -100)  # Cap at -100%
     n_bins = 25
-    bins = np.linspace(0, max_error, n_bins + 1)
+    bins = np.linspace(min_error, max_error, n_bins + 1)
     bin_width = bins[1] - bins[0]
 
     # Calculate width for each bar (divide bin width by number of cutoffs)
@@ -489,11 +494,12 @@ def generate_error_distribution_histogram_density(df, experiment_id, landmark_se
     # Plot histogram for each cutoff with offset positions
     for i, (cutoff, color) in enumerate(zip(cutoffs, colors)):
         # Filter data by confidence cutoff
-        df_cutoff = df[df['mean_confidence'] >= cutoff]
+        # df_cutoff = df[df['mean_confidence'] >= cutoff]
+        df_cutoff = df[df['harmonic_mean_confidence'] >= cutoff]
 
         if len(df_cutoff) > 0:
             # Convert relative error to percentage
-            errors_pct = df_cutoff['relative_error'] * 100
+            errors_pct = np.clip(df_cutoff['relative_error'] * 100, min_error, max_error)
 
             # Compute histogram
             counts, _ = np.histogram(errors_pct, bins=bins)
@@ -513,8 +519,8 @@ def generate_error_distribution_histogram_density(df, experiment_id, landmark_se
 
     # Set labels and title
     ax.set_xlabel('Relative Error (%)', fontsize=12)
-    ax.set_ylabel('Density (Normalized Frequency)', fontsize=12)
-    ax.set_title(f'Error Distribution by Confidence Cutoff (Density): {experiment_id} ({landmark_set_name})',
+    ax.set_ylabel('Density', fontsize=12)
+    ax.set_title(f'Error Distribution by \nConfidence Cutoff (Density): {experiment_id} ({landmark_set_name})',
                 fontsize=14, fontweight='bold')
 
     # Add legend
@@ -524,7 +530,7 @@ def generate_error_distribution_histogram_density(df, experiment_id, landmark_se
     ax.grid(True, alpha=0.3, axis='y')
 
     # Set x-axis limits
-    ax.set_xlim(0, max_error)
+    ax.set_xlim(min_error, max_error)
 
     # Tight layout
     plt.tight_layout()
@@ -610,6 +616,13 @@ def print_summary_statistics(df, df_filtered):
     print(f"    Std:  {df_filtered['min_confidence'].std():.4f}")
     print(f"    Min:  {df_filtered['min_confidence'].min():.4f}")
     print(f"    Max:  {df_filtered['min_confidence'].max():.4f}")
+
+    # Error stats for |relative_error_absolute| < 60%
+    df_filtered_60 = df_filtered[np.abs(df_filtered['relative_error']) < 0.60]
+    print(f"\nError Statistics (|relative_error| < 60%):")
+    print(f"  Absolute error (pixels):")
+    print(f"    Mean: {df_filtered_60['relative_error'].mean():.2f}")
+    print(f"    Std:  {df_filtered_60['relative_error'].std():.2f}")
 
     # Correlation between confidence and error
     correlation_mean = df_filtered['mean_confidence'].corr(df_filtered['relative_error'])
