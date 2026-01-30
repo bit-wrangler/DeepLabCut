@@ -449,8 +449,13 @@ if __name__ == "__main__":
             # Error multiplier = 1 + N(mean, std), applied once per image (shared across all limbs)
             'body_length_error_mean': 0.0,  # Mean of the random error distribution
             'body_length_error_std': 0.05,  # Std of the random error distribution
+            # Skeletal loss SVL mode: 'ground_truth_svl' or 'predicted_svl'
+            # 'ground_truth_svl': uses ground truth body length for normalization (with optional error injection)
+            # 'predicted_svl': uses predicted body length for normalization (no error injection)
+            'skeletal_loss_svl_mode': 'predicted_svl',
+            'skeletal_loss_svl_confidence_threshold': 0.5,  # Confidence threshold for SVL landmarks (predicted_svl mode only)
           },
-          'experiment_id': 'll_0d05_with_body_length_error_0d05',
+          'experiment_id': 'll_0d05_no_gt',
           'group_by_video': True,
         }
 

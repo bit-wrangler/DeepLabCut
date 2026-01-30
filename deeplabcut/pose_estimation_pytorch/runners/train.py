@@ -591,6 +591,194 @@ def compute_skeletal_constraint_loss(
 
     return total_loss
 
+
+def compute_skeletal_constraint_loss_predicted_svl(
+    predicted_keypoints: torch.Tensor,
+    skeletal_data: dict,
+    bodyparts: list[str],
+    device: torch.device,
+    loss_weight: float = 1.0,
+    radius_multiplier: float = 1.0,
+    svl_confidence_threshold: float = 0.5,
+    svl_min_length: float = 10.0
+) -> torch.Tensor:
+    """
+    Compute skeletal constraint loss using predicted body length (SVL) for normalization.
+
+    This version uses the predicted snout-to-tail1 distance for scaling instead of
+    ground truth body length. If the confidence of either snout or tail1 is below
+    the threshold, no loss is computed for that image.
+
+    Args:
+        predicted_keypoints: Tensor of shape (batch_size, num_animals, num_joints, 3)
+                           where last dim is [x, y, visibility]
+        skeletal_data: Dict containing 'links' and 'link_lengths' arrays
+        bodyparts: List of bodypart names to get indices
+        device: Device to put tensors on
+        loss_weight: Weight for the skeletal loss
+        radius_multiplier: Multiplier for the skeletal radius
+        svl_confidence_threshold: Confidence threshold for snout and tail1 landmarks
+                                  to compute loss (default: 0.5)
+
+    Returns:
+        Skeletal constraint loss tensor
+    """
+    if not skeletal_data or len(skeletal_data.get('links', [])) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    batch_size = predicted_keypoints.shape[0]
+    sample_losses = []
+
+    # Get indices for snout and tail1 for normalization
+    try:
+        snout_idx = bodyparts.index('snout')
+        tail1_idx = bodyparts.index('tail1')
+    except ValueError:
+        # If snout or tail1 not in bodyparts, return zero loss
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    for batch_idx in range(batch_size):
+        # Get skeletal data for this sample
+        if isinstance(skeletal_data['links'], torch.Tensor):
+            # If it's already a tensor, assume it's the same for all samples in batch
+            links = skeletal_data['links']
+            link_lengths = skeletal_data['link_lengths']
+        elif isinstance(skeletal_data['links'], (list, np.ndarray)):
+            # If it's a list/array, get the data for this batch index
+            if len(skeletal_data['links']) > batch_idx:
+                links = skeletal_data['links'][batch_idx]
+                link_lengths = skeletal_data['link_lengths'][batch_idx]
+            else:
+                # Use the same data for all samples (broadcast)
+                links = skeletal_data['links'][0] if len(skeletal_data['links']) > 0 else []
+                link_lengths = skeletal_data['link_lengths'][0] if len(skeletal_data['link_lengths']) > 0 else []
+        else:
+            links = skeletal_data['links']
+            link_lengths = skeletal_data['link_lengths']
+
+        if len(links) == 0:
+            continue
+
+        # Convert to tensors if needed
+        if not isinstance(links, torch.Tensor):
+            links = torch.tensor(links, device=device, dtype=torch.long)
+        if not isinstance(link_lengths, torch.Tensor):
+            link_lengths = torch.tensor(link_lengths, device=device, dtype=torch.float32)
+
+        # Get keypoints for this sample (assuming single animal for now)
+        kpts = predicted_keypoints[batch_idx, 0]  # Shape: (num_joints, 3)
+
+        # Check if snout and tail1 are visible with sufficient confidence for SVL normalization
+        snout_vis = kpts[snout_idx, 2] > svl_confidence_threshold
+        tail1_vis = kpts[tail1_idx, 2] > svl_confidence_threshold
+
+        if not (snout_vis and tail1_vis):
+            # Cannot compute SVL normalization, skip this sample entirely
+            continue
+
+        # Compute predicted SVL (snout to tail1 distance) for normalization
+        snout_pos = kpts[snout_idx, :2]  # [x, y]
+        tail1_pos = kpts[tail1_idx, :2]  # [x, y]
+        predicted_svl = torch.norm(snout_pos - tail1_pos)
+
+        if predicted_svl < svl_min_length:  # Avoid division by zero and unreasonably small SVL
+            continue
+
+        # Find expected SVL from ground truth link lengths
+        expected_svl_length = None
+        for svl_idx in range(len(links)):
+            link = links[svl_idx]
+            if isinstance(link, torch.Tensor):
+                if link.dim() == 1 and len(link) >= 2:
+                    svl_bp1, svl_bp2 = link[0].item(), link[1].item()
+                else:
+                    continue
+            elif isinstance(link, (list, tuple)) and len(link) >= 2:
+                svl_bp1, svl_bp2 = link[0], link[1]
+            else:
+                continue
+
+            if (svl_bp1 == snout_idx and svl_bp2 == tail1_idx) or (svl_bp1 == tail1_idx and svl_bp2 == snout_idx):
+                expected_svl_length = link_lengths[svl_idx]
+                if isinstance(expected_svl_length, torch.Tensor) and expected_svl_length.dim() == 0:
+                    expected_svl_length = expected_svl_length.item()
+                break
+
+        if expected_svl_length is None or expected_svl_length <= 0:
+            # Cannot find expected SVL, skip this sample
+            continue
+
+        link_losses = []
+
+        for link_idx in range(len(links)):
+            # Check bounds for both links and link_lengths
+            if link_idx >= len(link_lengths):
+                continue  # Skip if no corresponding length data
+
+            link = links[link_idx]
+            expected_length = link_lengths[link_idx]
+
+            # Handle different tensor/list formats
+            if isinstance(link, torch.Tensor):
+                if link.dim() == 0:  # 0-d tensor (scalar)
+                    continue  # Skip invalid links
+                elif link.dim() == 1 and len(link) >= 2:
+                    bp1_idx, bp2_idx = link[0].item(), link[1].item()
+                else:
+                    continue  # Skip invalid links
+            elif isinstance(link, (list, tuple)) and len(link) >= 2:
+                bp1_idx, bp2_idx = link[0], link[1]
+            else:
+                continue  # Skip invalid links
+
+            # Handle expected_length format
+            if isinstance(expected_length, torch.Tensor):
+                if expected_length.dim() == 0:
+                    expected_length = expected_length.item()
+                else:
+                    continue  # Skip invalid expected lengths
+
+            # Skip if expected length is NaN or invalid
+            if torch.isnan(torch.tensor(expected_length)) or expected_length <= 0:
+                continue
+
+            # Check if both keypoints are visible (using standard 0.5 threshold for limbs)
+            bp1_vis = kpts[bp1_idx, 2] > 0.5
+            bp2_vis = kpts[bp2_idx, 2] > 0.5
+
+            if not (bp1_vis and bp2_vis):
+                continue
+
+            # Compute predicted distance
+            bp1_pos = kpts[bp1_idx, :2]
+            bp2_pos = kpts[bp2_idx, :2]
+            predicted_distance = torch.norm(bp1_pos - bp2_pos)
+
+            # Normalize predicted distance by predicted SVL
+            normalized_predicted = predicted_distance / predicted_svl
+
+            # Normalize expected length by expected SVL to get relative proportion
+            normalized_expected = expected_length / expected_svl_length
+
+            # Compute constraint loss: 0 if pred <= expected, (pred - expected)^2 if pred > expected
+            diff = normalized_predicted - normalized_expected * radius_multiplier
+            link_loss = torch.where(diff > 0, diff ** 2, torch.tensor(0.0, device=device))
+            link_losses.append(link_loss)
+
+        if len(link_losses) > 0:
+            # Stack and average the losses to avoid in-place operations
+            sample_loss = torch.stack(link_losses).mean()
+            sample_losses.append(sample_loss)
+
+    if len(sample_losses) > 0:
+        # Stack and average all sample losses to avoid in-place operations
+        total_loss = torch.stack(sample_losses).mean() * loss_weight
+    else:
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+    return total_loss
+
+
 def compute_skeletal_constraint_loss2(
     predicted_keypoints: torch.Tensor,
     skeletal_data: dict,
@@ -892,6 +1080,18 @@ class TrainingRunner(Runner, Generic[ModelType], metaclass=ABCMeta):
         self.body_length_error_std = 0.05
         if "body_length_error_std" in self.model_cfg:
             self.body_length_error_std = self.model_cfg["body_length_error_std"]
+
+        # Config to switch between skeletal loss versions:
+        # 'ground_truth_svl': uses ground truth body length for normalization (with optional error injection)
+        # 'predicted_svl': uses predicted body length for normalization (no error injection)
+        self.skeletal_loss_svl_mode = 'ground_truth_svl'
+        if "skeletal_loss_svl_mode" in self.model_cfg:
+            self.skeletal_loss_svl_mode = self.model_cfg["skeletal_loss_svl_mode"]
+
+        # Confidence threshold for SVL landmarks when using predicted_svl mode
+        self.skeletal_loss_svl_confidence_threshold = 0.5
+        if "skeletal_loss_svl_confidence_threshold" in self.model_cfg:
+            self.skeletal_loss_svl_confidence_threshold = self.model_cfg["skeletal_loss_svl_confidence_threshold"]
 
         self.union_intersect_adjacent_skeletal_mask_alpha = self.union_intersect_adjacent_skeletal_mask_alpha_start
         self.skeletal_radius_multiplier = self.skeletal_radius_multiplier_start
@@ -1237,17 +1437,30 @@ class PoseTrainingRunner(TrainingRunner[PoseModel]):
                         "link_lengths": batch["skeletal_data"]["link_lengths"]
                     }
 
-                    # Get skeletal constraint loss
-                    skeletal_loss = compute_skeletal_constraint_loss(
-                        predicted_keypoints=predicted_keypoints,
-                        skeletal_data=skeletal_data_for_loss,
-                        bodyparts=bodyparts,
-                        device=self.device,
-                        loss_weight=skeletal_loss_weight,
-                        radius_multiplier=self.skeletal_loss_radius_multiplier,
-                        body_length_error_mean=self.body_length_error_mean,
-                        body_length_error_std=self.body_length_error_std
-                    )
+                    # Get skeletal constraint loss based on configured SVL mode
+                    if self.skeletal_loss_svl_mode == 'predicted_svl':
+                        # Use predicted body length for normalization (no error injection)
+                        skeletal_loss = compute_skeletal_constraint_loss_predicted_svl(
+                            predicted_keypoints=predicted_keypoints,
+                            skeletal_data=skeletal_data_for_loss,
+                            bodyparts=bodyparts,
+                            device=self.device,
+                            loss_weight=skeletal_loss_weight,
+                            radius_multiplier=self.skeletal_loss_radius_multiplier,
+                            svl_confidence_threshold=self.skeletal_loss_svl_confidence_threshold
+                        )
+                    else:
+                        # Default: use ground truth body length (with optional error injection)
+                        skeletal_loss = compute_skeletal_constraint_loss(
+                            predicted_keypoints=predicted_keypoints,
+                            skeletal_data=skeletal_data_for_loss,
+                            bodyparts=bodyparts,
+                            device=self.device,
+                            loss_weight=skeletal_loss_weight,
+                            radius_multiplier=self.skeletal_loss_radius_multiplier,
+                            body_length_error_mean=self.body_length_error_mean,
+                            body_length_error_std=self.body_length_error_std
+                        )
 
                     losses_dict["skeletal_loss"] = skeletal_loss
                     # Create a new tensor to avoid in-place operations
