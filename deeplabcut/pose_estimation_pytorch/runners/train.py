@@ -410,6 +410,8 @@ def compute_skeletal_constraint_loss(
     device: torch.device,
     loss_weight: float = 1.0,
     radius_multiplier: float = 1.0,
+    body_length_error_mean: float = 0.0,
+    body_length_error_std: float = 0.05,
 ) -> torch.Tensor:
     """
     Compute skeletal constraint loss based on expected limb lengths.
@@ -422,6 +424,8 @@ def compute_skeletal_constraint_loss(
         device: Device to put tensors on
         loss_weight: Weight for the skeletal loss
         radius_multiplier: Multiplier for the skeletal radius
+        body_length_error_mean: Mean of the random error distribution for corrupting body lengths
+        body_length_error_std: Std of the random error distribution for corrupting body lengths
 
     Returns:
         Skeletal constraint loss tensor
@@ -431,6 +435,18 @@ def compute_skeletal_constraint_loss(
 
     batch_size = predicted_keypoints.shape[0]
     sample_losses = []
+
+    # Generate random error multipliers for each image in the batch (one per image, shared across all limbs)
+    # Error multiplier = 1 + N(mean, std), so the corrupted length = true_length * error_multiplier
+    if body_length_error_std > 0:
+        error_multipliers = 1.0 + torch.normal(
+            mean=body_length_error_mean,
+            std=body_length_error_std,
+            size=(batch_size,),
+            device=device
+        )
+    else:
+        error_multipliers = torch.ones(batch_size, device=device) * (1.0 + body_length_error_mean)
 
     # Get indices for snout and tail1 for normalization
     try:
@@ -548,8 +564,11 @@ def compute_skeletal_constraint_loss(
                     break
 
             if expected_svl_length is not None and expected_svl_length > 0:
-                # Normalize expected length by expected SVL to get relative proportion
-                normalized_expected = expected_length / expected_svl_length
+                # Apply random error to corrupt the ground truth body length
+                # The error multiplier is the same for all limbs in this image
+                corrupted_svl_length = expected_svl_length * error_multipliers[batch_idx]
+                # Normalize expected length by corrupted SVL to get relative proportion
+                normalized_expected = expected_length / corrupted_svl_length
             else:
                 # If we can't find expected SVL, skip this constraint
                 continue
@@ -864,6 +883,15 @@ class TrainingRunner(Runner, Generic[ModelType], metaclass=ABCMeta):
         self.truncate_targets = False
         if "truncate_targets" in self.model_cfg:
             self.truncate_targets = self.model_cfg["truncate_targets"]
+
+        # Body length error injection config (for corrupting ground truth body lengths)
+        self.body_length_error_mean = 0.0
+        if "body_length_error_mean" in self.model_cfg:
+            self.body_length_error_mean = self.model_cfg["body_length_error_mean"]
+
+        self.body_length_error_std = 0.05
+        if "body_length_error_std" in self.model_cfg:
+            self.body_length_error_std = self.model_cfg["body_length_error_std"]
 
         self.union_intersect_adjacent_skeletal_mask_alpha = self.union_intersect_adjacent_skeletal_mask_alpha_start
         self.skeletal_radius_multiplier = self.skeletal_radius_multiplier_start
@@ -1216,7 +1244,9 @@ class PoseTrainingRunner(TrainingRunner[PoseModel]):
                         bodyparts=bodyparts,
                         device=self.device,
                         loss_weight=skeletal_loss_weight,
-                        radius_multiplier=self.skeletal_loss_radius_multiplier
+                        radius_multiplier=self.skeletal_loss_radius_multiplier,
+                        body_length_error_mean=self.body_length_error_mean,
+                        body_length_error_std=self.body_length_error_std
                     )
 
                     losses_dict["skeletal_loss"] = skeletal_loss

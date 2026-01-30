@@ -34,7 +34,7 @@ if not os.path.exists(config_path):
 
 # Number of folds for cross-validation
 N_FOLDS = 5
-N_SEEDS = 8
+N_SEEDS = 2
 SHUFFLE_OFFSET = 100
 
 # Note: Shuffle numbers are automatically assigned to prevent collisions
@@ -429,7 +429,7 @@ if __name__ == "__main__":
         }
     experiment = {
             'train_overrides': {
-            'skeletal_loss_weight': 0.0,
+            'skeletal_loss_weight': 0.05,
             'skeletal_loss_radius_multiplier': 1.0,
             'skeletal_radius_multiplier_start': 1.05,
             'skeletal_radius_multiplier_end': 1.05,
@@ -445,8 +445,12 @@ if __name__ == "__main__":
             'runner.key_metric': 'test.rmse',
             'runner.key_metric_asc': False,
             'train_settings.batch_size': TRAIN_BATCH_SIZE,
+            # Body length error injection: adds random multiplicative error to ground truth body lengths
+            # Error multiplier = 1 + N(mean, std), applied once per image (shared across all limbs)
+            'body_length_error_mean': 0.0,  # Mean of the random error distribution
+            'body_length_error_std': 0.05,  # Std of the random error distribution
           },
-          'experiment_id': 'control',
+          'experiment_id': 'll_0d05_with_body_length_error_0d05',
           'group_by_video': True,
         }
 
