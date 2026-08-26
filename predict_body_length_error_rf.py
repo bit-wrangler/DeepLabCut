@@ -39,7 +39,12 @@ import joblib
 EXPERIMENT_ID = 'control'          # Experiment to analyze
 LANDMARK_SET_NAME = 'all'           # Landmark set ('all', 'truncated', etc.)
 
-# Body length calculation settings
+# Body length calculation settings.
+# NOTE: these must match the training run's `svl_landmarks` (model config; also
+# recorded in the `override__svl_landmarks` column of cv_results_*.csv). They are
+# NOT read from it automatically. A run trained with ['snout', 'spine6'] but
+# analysed with 'tail1' here reports the ~17% scale inflation that the
+# svl_landmarks change exists to remove.
 BODYPART_1 = 'snout'                # First bodypart for body length
 BODYPART_2 = 'tail1'                # Second bodypart for body length
 

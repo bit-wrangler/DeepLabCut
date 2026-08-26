@@ -140,3 +140,7 @@ ENV/
 .mypy_cache/
 
 *.csv
+# --- research fork: local artefacts not part of the release ---
+.~lock.*#
+release/frame_level_results.zip
+cv_frame_level_results_*.csv

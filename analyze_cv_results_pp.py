@@ -15,8 +15,9 @@ Outputs:
 1) Control and Method mean ± std (descriptives)
 2) Paired deltas (Method - Control): mean, sd, SE, 95% CI
 3) Paired t-test p-value
-4) Sign-flip permutation p-value (optional)
-5) Estimated required n (paired) for Δ=0.25 and Δ=0.5 at POWER_TARGET, alpha=ALPHA
+4) Wilcoxon signed-rank p-value (rank-based; robust to outlier splits)
+5) Sign-flip permutation p-value (optional)
+6) Estimated required n (paired) for Δ=0.25 and Δ=0.5 at POWER_TARGET, alpha=ALPHA
    based on observed sd of paired differences.
 
 Note: n here is number of paired Shuffle numbers.
@@ -217,6 +218,15 @@ def main():
 
         t_stat, p_t = stats.ttest_rel(y, x, nan_policy="omit")
 
+        # Wilcoxon signed-rank: rank-based paired test, robust to a few
+        # high-magnitude (outlier) split differences. Raises when all paired
+        # differences are zero; report NaN in that degenerate case.
+        try:
+            _, p_w = stats.wilcoxon(y, x)
+            p_w = float(p_w)
+        except ValueError:
+            p_w = float("nan")
+
         t_crit = float(stats.t.ppf(1 - ALPHA / 2, df=n - 1))
         ci_lo = mean_d - t_crit * se_d
         ci_hi = mean_d + t_crit * se_d
@@ -242,6 +252,7 @@ def main():
             "delta_sd": round(sd_d, DECIMALS),
             "delta_95%CI": f"[{ci_lo:.{DECIMALS}f}, {ci_hi:.{DECIMALS}f}]",
             "paired_t_p": float(p_t),
+            "wilcoxon_p": p_w,
             "perm_p": float(p_perm),
             "corr_rho": round(rho, 4) if np.isfinite(rho) else float("nan"),
         }
@@ -263,6 +274,7 @@ def main():
                 f"Δ {r['delta_mean']:>8} (sd {r['delta_sd']:>8}) | "
                 f"CI {r['delta_95%CI']:>22s} | "
                 f"p_t={r['paired_t_p']:.3g} | "
+                f"p_wilcox={r['wilcoxon_p']:.3g} | "
                 f"p_perm={r['perm_p']:.3g} | ρ={r['corr_rho']}"
             )
         print("")
@@ -282,6 +294,7 @@ def main():
         "delta_sd",
         "delta_95%CI",
         "paired_t_p",
+        "wilcoxon_p",
         "perm_p",
         "corr_rho",
     ]

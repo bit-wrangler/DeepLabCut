@@ -2,8 +2,9 @@ import pandas as pd
 import os
 
 # Configuration
-EXPERIMENT_ID = 'll_0d2'
+EXPERIMENT_ID = 'tht_gt_1d05_fix' # 'll_0d05'
 LANDMARK_SET_NAMES = ['all', 'truncated', 'non_truncated']
+MAX_LIST_IDX = 40
 
 # Metric names to analyze
 METRIC_NAMES = ['test rmse', 'test rmse_pcutoff', 'test mAP', 'test mAR']
@@ -21,7 +22,7 @@ def main():
     
     # Load results
     print(f"Loading results from: {results_file}")
-    results_df = pd.read_csv(results_file)
+    results_df = pd.read_csv(results_file)[:MAX_LIST_IDX]
     print(f"Loaded {len(results_df)} results\n")
     
     # Build column names based on landmark sets and metrics

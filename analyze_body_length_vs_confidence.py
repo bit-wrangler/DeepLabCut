@@ -39,7 +39,12 @@ import sys
 EXPERIMENT_ID = 'control'          # Experiment to analyze
 LANDMARK_SET_NAME = 'all'           # Landmark set ('all', 'truncated', etc.)
 
-# Body length calculation settings
+# Body length calculation settings.
+# NOTE: these must match the training run's `svl_landmarks` (model config; also
+# recorded in the `override__svl_landmarks` column of cv_results_*.csv). They are
+# NOT read from it automatically. A run trained with ['snout', 'spine6'] but
+# analysed with 'tail1' here reports the ~17% scale inflation that the
+# svl_landmarks change exists to remove.
 BODYPART_1 = 'snout'                # First bodypart for body length
 BODYPART_2 = 'tail1'                # Second bodypart for body length
 
@@ -473,7 +478,7 @@ def generate_error_distribution_histogram_density(df, experiment_id, landmark_se
         return
 
     # Define confidence cutoffs
-    cutoffs = [0.9, 0.7, 0.5,0.]
+    cutoffs = [0.5]
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']  # Blue, orange, green, red
 
     # Create figure
@@ -483,7 +488,7 @@ def generate_error_distribution_histogram_density(df, experiment_id, landmark_se
     # Use relative error in percentage
     max_error = min(df['relative_error'].max() * 100, 100)  # Cap at 100%
     min_error = max(df['relative_error'].min() * 100, -100)  # Cap at -100%
-    n_bins = 25
+    n_bins = 100
     bins = np.linspace(min_error, max_error, n_bins + 1)
     bin_width = bins[1] - bins[0]
 
@@ -524,7 +529,7 @@ def generate_error_distribution_histogram_density(df, experiment_id, landmark_se
                 fontsize=14, fontweight='bold')
 
     # Add legend
-    ax.legend(loc='upper right', fontsize=10)
+    # ax.legend(loc='upper right', fontsize=10)
 
     # Add grid
     ax.grid(True, alpha=0.3, axis='y')

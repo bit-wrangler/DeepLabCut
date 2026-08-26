@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import warnings
 
 import albumentations as A
 import numpy as np
@@ -34,6 +35,10 @@ from deeplabcut.pose_estimation_pytorch.data.utils import (
     out_of_bounds_keypoints,
     pad_to_length,
     safe_stack,
+)
+from deeplabcut.pose_estimation_pytorch.skeletal_config import (
+    DEFAULT_SVL_LANDMARKS,
+    validate_svl_landmarks,
 )
 from deeplabcut.pose_estimation_pytorch.task import Task
 
@@ -546,23 +551,63 @@ class PoseDataset(Dataset):
         return np.concatenate((keypoints, centers), axis=1)
 
 
-def create_skeleton_dictionary(cfg, skeletal_csv_path):
+def create_skeleton_dictionary(cfg, skeletal_csv_path, svl_landmarks=None):
     """
     Loads skeletal data from CSV and maps it to body part indices from the DLC config.
+
+    Args:
+        cfg: Project config, used for the 'bodyparts' list.
+        skeletal_csv_path: Path to the per-specimen X-ray measurement CSV.
+        svl_landmarks: Landmark pair that the 'svl' trait is attached to. Pass the
+            value resolved from the model config with ``resolve_svl_landmarks`` so
+            the dataset and the runner cannot disagree about which pair carries
+            the SVL reference length. Defaults to ('snout', 'tail1').
     """
     print("Creating skeleton dictionary from CSV...")
     bodyparts = cfg['bodyparts']
 
+    if svl_landmarks is None:
+        svl_landmarks = DEFAULT_SVL_LANDMARKS
+
+    # Shape is always validated. *Membership* is validated only for a pair that
+    # differs from the historical default: a project whose bodyparts simply do
+    # not contain 'snout'/'tail1' has always degraded gracefully here (the svl
+    # link is dropped by the `bp1_name in bodyparts` guard below and every
+    # skeletal path becomes a no-op), and it must keep doing so. Validating the
+    # default would turn that graceful degrade into a hard crash, and would
+    # blame a config key the user never wrote.
+    svl_pair = validate_svl_landmarks(svl_landmarks, None, source="model config")
+    if svl_pair != DEFAULT_SVL_LANDMARKS:
+        validate_svl_landmarks(svl_pair, bodyparts, source="model config")
+
     # Mapping from CSV columns to body part pairs
     # Based on the specific skeletal measurements provided
     link_mapping = {
-        'svl': [('snout', 'tail1')],
+        'svl': [svl_pair],
         'head.length': [('snout', 'base_of_head')],
         'upper.forelimb': [('left_shoulder', 'left_elbow'), ('right_shoulder', 'right_elbow')],
         'lower.forelimb': [('left_elbow', 'left_wrist'), ('right_elbow', 'right_wrist')],
         'upper.hindlimb': [('left_hip', 'left_knee'), ('right_hip', 'right_knee')],
         'lower.hindlimb': [('left_knee', 'left_ankle'), ('right_knee', 'right_ankle')],
     }
+
+    # A pair that another trait already owns would be emitted twice, with two
+    # different millimetre lengths, and the two consumers would then disagree:
+    # apply_skeletal_target_masking builds a name-keyed dict and so keeps the
+    # LAST length, while the limb-length-loss search loop breaks on the FIRST.
+    # THT and LLL would silently normalise by different references. Refuse.
+    for trait, pairs in link_mapping.items():
+        if trait == 'svl':
+            continue
+        for bp1_name, bp2_name in pairs:
+            if {bp1_name, bp2_name} == {svl_pair[0], svl_pair[1]}:
+                raise ValueError(
+                    f"svl_landmarks {svl_pair} is already the landmark pair for "
+                    f"the '{trait}' measurement. The two traits would emit the "
+                    f"same link with different lengths, and target truncation "
+                    f"and the limb-length loss would silently use different "
+                    f"references. Pick a pair that no other trait uses."
+                )
 
     try:
         df = pd.read_csv(skeletal_csv_path)
@@ -571,6 +616,14 @@ def create_skeleton_dictionary(cfg, skeletal_csv_path):
         exit()
 
     skeleton_dict = {}
+    n_subjects_with_svl = 0
+    # None when the pair is not expressible in this project's bodyparts. That is
+    # the pre-existing no-op case (see the membership note above), not a
+    # misconfiguration, so it must not raise below.
+    if svl_pair[0] in bodyparts and svl_pair[1] in bodyparts:
+        svl_link = (bodyparts.index(svl_pair[0]), bodyparts.index(svl_pair[1]))
+    else:
+        svl_link = None
     for _, row in df.iterrows():
         subject_id = str(row['lizard_id']).zfill(4)
 
@@ -587,12 +640,60 @@ def create_skeleton_dictionary(cfg, skeletal_csv_path):
                         subject_links.append((bp1_idx, bp2_idx))
                         subject_lengths.append(link_length)
 
+        if svl_link is not None and svl_link in subject_links:
+            n_subjects_with_svl += 1
+
         skeleton_dict[subject_id] = {
             "links": subject_links,
             "link_lengths": subject_lengths,
         }
 
-    print(f"Loaded skeletal data for {len(skeleton_dict)} subjects.")
+    # Say something loud rather than let the SVL reference go missing: the
+    # mm->pixel scale is looked up by this exact landmark pair, and if it is never
+    # emitted px_per_mm silently returns None and X-ray-referenced truncation
+    # falls back to ground-truth distances -- a different mechanism, with no
+    # error. Per subject a missing 'svl' measurement is legitimate (rows are NA in
+    # the real CSV), so only a systematic absence is worth reporting.
+    if skeleton_dict and svl_link is not None and n_subjects_with_svl == 0:
+        _msg = (
+            f"No SVL reference length could be built for landmark pair {svl_pair} "
+            f"from {skeletal_csv_path}: the 'svl' column is missing or empty for "
+            f"every one of the {len(skeleton_dict)} subjects. Without it the "
+            f"mm->pixel scale is undefined, so the limb length loss contributes "
+            f"nothing and X-ray-referenced target truncation "
+            f"(use_skeletal_reference: True) falls back to ground-truth distances. "
+            f"Add an 'svl' column, or unset 'lizard_skeletal_data_path' to train "
+            f"without skeletal constraints."
+        )
+        # HARD error only when the pair differs from the historical default: the
+        # user has then stated an intent about the scale, so staying quiet would
+        # hide their mistake. (Testing `svl_landmarks is not None` would not work
+        # -- it is reassigned to the default just above, and base.py always passes
+        # a resolved pair, so it is never None on the real call path.)
+        #
+        # On the historical default this stays a warning, because a missing 'svl'
+        # column is not always an error: THT with `use_skeletal_reference: False`
+        # takes its radii from ground-truth inter-landmark distances and never
+        # consults the SVL scale, so a CSV carrying limb traits but no 'svl' is a
+        # legitimate THT (GT) setup that trained fine before this key existed --
+        # and THT (GT) is the configuration used in the confirmatory evaluation.
+        # Raising would break it. Same split as `resolve_svl_landmarks`, which
+        # validates an explicitly requested pair but not the legacy default.
+        if svl_pair != DEFAULT_SVL_LANDMARKS:
+            raise ValueError(_msg)
+        warnings.warn(_msg, RuntimeWarning, stacklevel=2)
+
+    if svl_link is None:
+        print(
+            f"Loaded skeletal data for {len(skeleton_dict)} subjects "
+            f"(no SVL reference: {svl_pair} is not in this project's bodyparts, "
+            f"so the skeletal mechanisms will be a no-op)."
+        )
+    else:
+        print(
+            f"Loaded skeletal data for {len(skeleton_dict)} subjects "
+            f"({n_subjects_with_svl} with an SVL reference for {svl_pair})."
+        )
     return skeleton_dict
 
 

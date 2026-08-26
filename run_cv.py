@@ -34,7 +34,7 @@ if not os.path.exists(config_path):
 
 # Number of folds for cross-validation
 N_FOLDS = 5
-N_SEEDS = 2
+N_SEEDS = 8
 SHUFFLE_OFFSET = 100
 
 # Note: Shuffle numbers are automatically assigned to prevent collisions
@@ -130,7 +130,15 @@ def run_single_fold(args):
             epochs=N_EPOCHS,
             )
 
-        # d. Evaluate the trained network on the held-out test set
+        # d. Extract and save loss curves from learning_stats.csv
+        learning_stats_path = str(
+            Path(project_path) / 'dlc-models-pytorch' / f'iteration-{cfg["iteration"]}' / trainingset_identifier / 'train' / 'learning_stats.csv'
+        )
+        loss_curve_file = f'cv_loss_curve_{experiment_id}_{fold_idx}_{seed_idx}.csv'
+        print(f"  Extracting loss curves for shuffle {shuffle_num}...")
+        extract_loss_curves(learning_stats_path, loss_curve_file)
+
+        # e. Evaluate the trained network on the held-out test set
         print(f"  Evaluating network for shuffle {shuffle_num}...")
         evaluation_results = {}
         for l_idx, (landmark_set_name, landmark_set) in enumerate(landmark_sets.items()):
@@ -221,6 +229,59 @@ def run_single_fold(args):
             os.remove(config_path)
 
 
+
+
+def extract_loss_curves(learning_stats_path, output_path):
+    """
+    Extract heatmap, locref, skeletal, and total loss curves from learning_stats.csv
+    and write them to a compact per-fold+seed CSV with clean column names.
+
+    The mapping from learning_stats.csv columns to output columns is:
+      losses/train.bodypart_heatmap  → train.heatmap
+      losses/train.bodypart_locref   → train.locref
+      losses/train.skeletal_loss     → train.skeletal
+      losses/train.total_loss        → train.total
+      losses/eval.bodypart_heatmap   → test.heatmap
+      losses/eval.bodypart_locref    → test.locref
+      losses/eval.skeletal_loss      → test.skeletal
+      losses/eval.total_loss         → test.total
+
+    Test columns will be NaN for steps where the eval pass was not run
+    (i.e. when eval_interval > 1).
+
+    Args:
+        learning_stats_path: Path to the learning_stats.csv produced during training.
+        output_path: Destination CSV path for the extracted loss curves.
+    """
+    if not os.path.exists(learning_stats_path):
+        print(f"Warning: learning_stats.csv not found at {learning_stats_path}, skipping loss curve extraction.")
+        return
+
+    df = pd.read_csv(learning_stats_path)
+
+    column_map = {
+        "losses/train.bodypart_heatmap": "train.heatmap",
+        "losses/train.bodypart_locref":  "train.locref",
+        "losses/train.skeletal_loss":    "train.skeletal",
+        "losses/train.total_loss":       "train.total",
+        "losses/eval.bodypart_heatmap":  "test.heatmap",
+        "losses/eval.bodypart_locref":   "test.locref",
+        "losses/eval.skeletal_loss":     "test.skeletal",
+        "losses/eval.total_loss":        "test.total",
+    }
+
+    # Only keep columns that actually exist in the file
+    available_map = {src: dst for src, dst in column_map.items() if src in df.columns}
+    missing = [src for src in column_map if src not in df.columns]
+    if missing:
+        print(f"  Note: the following columns were not found in learning_stats.csv and will be omitted: {missing}")
+
+    out_cols = ["step"] + list(available_map.values())
+    out_df = df[["step"] + list(available_map.keys())].rename(columns=available_map)
+    out_df = out_df[out_cols]  # enforce column order
+
+    out_df.to_csv(output_path, index=False)
+    print(f"  Loss curves saved to: {output_path} ({len(out_df)} rows, {len(out_cols)-1} loss columns)")
 
 
 def save_results_incrementally(results_df, results_file):
@@ -427,10 +488,49 @@ if __name__ == "__main__":
         'truncated': ['left_elbow', 'left_wrist', 'right_elbow', 'right_wrist', 'left_knee', 'left_ankle', 'right_knee', 'right_ankle'],
         'non_truncated': ['snout', 'base_of_head', 'left_shoulder', 'right_shoulder', 'spine1', 'spine6', 'spine2', 'spine3', 'spine4', 'spine5', 'left_hip', 'right_hip', 'tail1', 'tail6', 'tail2', 'tail3', 'tail4', 'tail5'],
         }
+    # --- LLL(w=0.05) re-run with a VENT-ANCHORED SVL -----------------------
+    # Replicates the headline extended-evaluation LLL run (`ll_0d05`,
+    # cv_results_ll_0d05.csv, 5 folds x 8 seeds = 40 paired splits) in every
+    # respect EXCEPT the landmark pair that defines snout-vent length.
+    #
+    # WHY. The CSV 'svl' trait is a physical snout-to-VENT measurement, but the
+    # historical pair is ('snout', 'tail1') and tail1 is the first TAIL landmark,
+    # sitting behind the vent. Over 1,623 labelled frames from 76 specimens,
+    #     k = ||snout-tail1|| / ||snout-spine6||   median 1.171, IQR 1.147-1.195
+    # and spine6 (the pelvic hub) is within 1.2% of SVL of the hip midpoint, so it
+    # is a near-exact vent proxy. LLL fires when
+    #     d_pred / S_pred  >  m * (L_mm / SVL_mm),
+    # and only the denominator moves with the pair, so running tail1 at m = 1 is
+    # arithmetically identical to running vent-anchored at an EFFECTIVE m of ~1.17
+    # -- a 17% slack band nobody asked for, and one that varies per frame (sd 5.7%
+    # of the mean) with the annotator's tail1 placement, so no sweep over m can
+    # reproduce or correct it. Measured on ground-truth labels, the fraction of
+    # limbs exceeding the reference is 5.1% under tail1 and 19.5% under spine6.
+    #
+    # PREDICTION, worth checking as a sanity test of the wiring itself: this run
+    # should behave like tail1 with m ~ 0.854, i.e. the penalised fraction should
+    # move from ~5% toward ~20%. If it does not, the equivalence above is wrong
+    # somewhere and that matters more than the result.
+    #
+    # CAVEAT ON THE COMPARISON. cv_results_ll_0d05.csv was written 2025-12-28, so
+    # contrasting against it mixes the scale change with ~8 months of code change.
+    # For a clean paired contrast, ALSO run the matched control below -- flip
+    # svl_landmarks back to ['snout', 'tail1'] and set experiment_id to
+    # 'll_0d05_rerun' -- and compare THAT against this run, fold-for-fold and
+    # seed-for-seed. Same pattern the THT fixed re-run used.
+    #
+    # The four keys that did not exist when ll_0d05 ran are pinned here to what the
+    # code did at the time, NOT to today's runner defaults -- in particular
+    # body_length_error_std, whose injection path was added 2026-01-30 (commit
+    # d710eabc), a month AFTER that run. The runner now defaults it to 0.05, so
+    # leaving it unset would silently add 5% multiplicative noise to every
+    # reference length and the run would not replicate.
+    # (Previous active config here was 'tht_gt_1d05_fix'.)
     experiment = {
             'train_overrides': {
+            # --- matches cv_results_ll_0d05.csv override__* columns exactly ---
             'skeletal_loss_weight': 0.05,
-            'skeletal_loss_radius_multiplier': 1.0,
+            'skeletal_loss_radius_multiplier': 1.17,
             'skeletal_radius_multiplier_start': 1.05,
             'skeletal_radius_multiplier_end': 1.05,
             'union_intersect_adjacent_skeletal_mask_alpha_start': 0.0,
@@ -438,24 +538,24 @@ if __name__ == "__main__":
             'union_intersect_adjacent_skeletal_mask_start_epoch': 0,
             'union_intersect_adjacent_skeletal_mask_end_epoch': 1,
             'use_skeletal_reference': False,
-            'truncate_targets': False,
+            'truncate_targets': False,          # LLL only -- no target truncation
             'model.heads.bodypart.predictor.locref_std': 7.2801,
             'model.heads.bodypart.target_generator.locref_std': 7.2801,
             'model.heads.bodypart.target_generator.pos_dist_thresh': 17,
             'runner.key_metric': 'test.rmse',
             'runner.key_metric_asc': False,
             'train_settings.batch_size': TRAIN_BATCH_SIZE,
-            # Body length error injection: adds random multiplicative error to ground truth body lengths
-            # Error multiplier = 1 + N(mean, std), applied once per image (shared across all limbs)
-            'body_length_error_mean': 0.0,  # Mean of the random error distribution
-            'body_length_error_std': 0.05,  # Std of the random error distribution
-            # Skeletal loss SVL mode: 'ground_truth_svl' or 'predicted_svl'
-            # 'ground_truth_svl': uses ground truth body length for normalization (with optional error injection)
-            # 'predicted_svl': uses predicted body length for normalization (no error injection)
-            'skeletal_loss_svl_mode': 'predicted_svl',
-            'skeletal_loss_svl_confidence_threshold': 0.5,  # Confidence threshold for SVL landmarks (predicted_svl mode only)
+            # --- absent from that CSV; pinned to the 2025-12-28 behaviour ---
+            'body_length_error_mean': 0.0,
+            'body_length_error_std': -1.0,      # OFF; the code did not exist then
+            'skeletal_loss_svl_mode': 'ground_truth_svl',
+            'skeletal_loss_svl_confidence_threshold': 0.5,
+            'skeletal_mask_half_cell_fix': False,   # runner default then and now
+            'skeletal_mask_preserve_peak': False,   # (inert here: truncation off)
+            # --- THE ONE DELIBERATE DIFFERENCE ---
+            'svl_landmarks': ['snout', 'spine6'],
           },
-          'experiment_id': 'll_0d05_no_gt',
+          'experiment_id': 'll_0d05_svl_spine6_m1d17',
           'group_by_video': True,
         }
 

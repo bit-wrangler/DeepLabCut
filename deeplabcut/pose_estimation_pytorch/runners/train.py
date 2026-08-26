@@ -38,7 +38,79 @@ from deeplabcut.pose_estimation_pytorch.runners.logger import (
     ImageLoggerMixin,
 )
 from deeplabcut.pose_estimation_pytorch.runners.snapshots import TorchSnapshotManager
+from deeplabcut.pose_estimation_pytorch.skeletal_config import (
+    DEFAULT_SVL_LANDMARKS,
+    resolve_svl_landmarks,
+)
 from deeplabcut.pose_estimation_pytorch.task import Task
+
+# (pair, context) keys already reported by _warn_missing_svl_reference, so each
+# distinct problem is logged once per process rather than once per image per
+# epoch. Keying on the context too means a spurious fire from one mechanism
+# cannot consume the alarm for a different one.
+_WARNED_MISSING_SVL_PAIRS: set = set()
+
+
+def _link_pairs_as_names(links, bodyparts) -> list:
+    """Render index links as (name, name) pairs, skipping anything malformed."""
+    pairs = []
+    for link in links:
+        try:
+            bp1, bp2 = int(link[0]), int(link[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if 0 <= bp1 < len(bodyparts) and 0 <= bp2 < len(bodyparts):
+            pairs.append((bodyparts[bp1], bodyparts[bp2]))
+    return pairs
+
+
+def _warn_missing_svl_reference(
+    available_pairs,
+    svl_landmarks: tuple[str, str],
+    context: str,
+) -> None:
+    """Warn (once per pair+context) when the configured SVL pair has no reference.
+
+    Without a reference length the mechanism silently *changes*: target
+    truncation falls back to ground-truth inter-landmark distances instead of the
+    X-ray-derived radii, and the limb-length losses skip the sample entirely and
+    contribute exactly 0.0.
+
+    Two different causes produce this and they call for different responses, so
+    the message names both:
+
+      * the specimen's ``svl`` cell in the morphology CSV is NA -- legitimate,
+        and present in the real data (a handful of lizards have no measurement);
+      * ``svl_landmarks`` does not match the pair ``create_skeleton_dictionary``
+        emitted -- a genuine misconfiguration.
+
+    The reliable discriminator is the ``N with an SVL reference for (...)`` line
+    ``create_skeleton_dictionary`` prints at dataset load: a large N means this is
+    the NA case, N == 0 for the pair the runner wants means a mismatch. A
+    whole-run mismatch is caught up front by
+    ``TrainingRunner._check_svl_reference_available``; this is the per-sample
+    backstop for callers that bypass ``fit()``.
+    """
+    svl_bp1, svl_bp2 = svl_landmarks
+    pairs = {tuple(p) for p in available_pairs}
+    if (svl_bp1, svl_bp2) in pairs or (svl_bp2, svl_bp1) in pairs:
+        return  # reference exists; it was missing for a visibility reason
+    key = (tuple(svl_landmarks), context)
+    if key in _WARNED_MISSING_SVL_PAIRS:
+        return
+    _WARNED_MISSING_SVL_PAIRS.add(key)
+    logging.warning(
+        "%s: no reference length for the configured SVL landmark pair %s in at "
+        "least one sample; the available reference pairs there are %s. Either "
+        "that specimen has no 'svl' measurement in the morphology CSV (harmless "
+        "-- some rows are NA), or 'svl_landmarks' in the model config does not "
+        "match the pair create_skeleton_dictionary emitted (not harmless: this "
+        "mechanism is then not running as configured). The 'N with an SVL "
+        "reference for ...' line printed at dataset load tells you which.",
+        context,
+        svl_landmarks,
+        sorted({tuple(sorted(p)) for p in pairs}),
+    )
 
 
 def _get_heat( target: dict, head: str = "bodypart"):
@@ -67,11 +139,22 @@ def _apply_mask_inplace(heat: torch.Tensor, b: int, c: int, mask: torch.Tensor, 
     else:
         heat[b, :, :, c] *= mask
 
-def _compute_scale_factor_svl(animal_keypoints, bodyparts, skeletal_links_lengths):
-    """Return mm->pixel scale using SVL if available; else None."""
+def _compute_scale_factor_svl(
+    animal_keypoints,
+    bodyparts,
+    skeletal_links_lengths,
+    svl_landmarks: tuple[str, str] = DEFAULT_SVL_LANDMARKS,
+):
+    """Return mm->pixel scale using SVL if available; else None.
+
+    ``svl_landmarks`` is the landmark pair standing in for snout-vent length; it
+    must match the pair ``create_skeleton_dictionary`` attached the 'svl' trait
+    to, otherwise the reference lookup below misses.
+    """
+    svl_bp1, svl_bp2 = svl_landmarks
     try:
-        snout_idx = bodyparts.index('snout')
-        tail1_idx = bodyparts.index('tail1')
+        snout_idx = bodyparts.index(svl_bp1)
+        tail1_idx = bodyparts.index(svl_bp2)
     except ValueError:
         return None
 
@@ -86,10 +169,10 @@ def _compute_scale_factor_svl(animal_keypoints, bodyparts, skeletal_links_length
 
     # Expected SVL (mm) from reference
     expected_svl_mm = None
-    if ('snout', 'tail1') in skeletal_links_lengths:
-        expected_svl_mm = float(skeletal_links_lengths[('snout', 'tail1')])
-    elif ('tail1', 'snout') in skeletal_links_lengths:
-        expected_svl_mm = float(skeletal_links_lengths[('tail1', 'snout')])
+    if (svl_bp1, svl_bp2) in skeletal_links_lengths:
+        expected_svl_mm = float(skeletal_links_lengths[(svl_bp1, svl_bp2)])
+    elif (svl_bp2, svl_bp1) in skeletal_links_lengths:
+        expected_svl_mm = float(skeletal_links_lengths[(svl_bp2, svl_bp1)])
 
     if expected_svl_mm is None or expected_svl_mm <= 0:
         return None
@@ -106,6 +189,10 @@ def apply_skeletal_target_masking(
     stride: float = 4.0,
     skeletal_radius_multiplier: float = 1.0,
     union_intersect_adjacent_skeletal_mask_alpha: float = 0.5,
+    half_cell_fix: bool = False,
+    preserve_peak: bool = False,
+    pos_dist_thresh: float = 17.0,
+    svl_landmarks: tuple[str, str] = DEFAULT_SVL_LANDMARKS,
 ) -> dict:
     """
     Truncate gaussian targets using skeletal limb lengths.
@@ -177,7 +264,13 @@ def apply_skeletal_target_masking(
             link_len[(bp2, bp1)] = L
 
         # mm->pixel scale via SVL (if present/visible)
-        px_per_mm = _compute_scale_factor_svl(animal_kpts, bodyparts, link_len)
+        px_per_mm = _compute_scale_factor_svl(
+            animal_kpts, bodyparts, link_len, svl_landmarks
+        )
+        if px_per_mm is None:
+            _warn_missing_svl_reference(
+                link_len.keys(), svl_landmarks, "Skeletal target truncation"
+            )
 
         # precompute grid once per sample
         yy, xx = torch.meshgrid(
@@ -221,8 +314,12 @@ def apply_skeletal_target_masking(
                         continue
 
                 # map to heatmap coordinates
-                cx = torch.tensor(adj_x_img / stride, device=device, dtype=torch.float32)
-                cy = torch.tensor(adj_y_img / stride, device=device, dtype=torch.float32)
+                # half_cell_fix: measure distances to cell CENTRES
+                # (idx*stride + stride/2), matching the Gaussian target frame,
+                # instead of cell corners (the original off-by-half-cell).
+                half_cell = 0.5 if half_cell_fix else 0.0
+                cx = torch.tensor(adj_x_img / stride - half_cell, device=device, dtype=torch.float32)
+                cy = torch.tensor(adj_y_img / stride - half_cell, device=device, dtype=torch.float32)
                 r = torch.tensor(L_px / stride * skeletal_radius_multiplier,
                                  device=device, dtype=torch.float32)
 
@@ -241,6 +338,19 @@ def apply_skeletal_target_masking(
                 alpha = float(union_intersect_adjacent_skeletal_mask_alpha)
                 mask = (1.0 - alpha) * union_mask + alpha * inter_mask
 
+            if preserve_peak and float(animal_kpts[limb_idx, 2]) >= 0.5:
+                # Guarantee the joint's own peak + positive disk (radius
+                # pos_dist_thresh) always survives, so THT can never delete the
+                # true-joint target. The disk is centred in the cell-CENTRE
+                # frame (always -0.5, independent of half_cell_fix) because the
+                # Gaussian's argmax cell lives in that frame; using the corner
+                # frame here can miss the peak by a cell.
+                pcx = float(animal_kpts[limb_idx, 0]) / stride - 0.5
+                pcy = float(animal_kpts[limb_idx, 1]) / stride - 0.5
+                peak_disk = (torch.sqrt((xx - pcx) ** 2 + (yy - pcy) ** 2)
+                             <= (pos_dist_thresh / stride)).float()
+                mask = torch.maximum(mask, peak_disk)
+
             _apply_mask_inplace(heat, b, limb_idx, mask, channels_first=channels_first)
 
     return target
@@ -253,7 +363,10 @@ def apply_skeletal_target_masking_simple(
     device: torch.device,
     stride: float = 4.0,  # Default stride for ResNet-based models
     skeletal_radius_multiplier: float = 1.0,
-    union_intersect_adjacent_skeletal_mask_alpha: float = 0.5
+    union_intersect_adjacent_skeletal_mask_alpha: float = 0.5,
+    half_cell_fix: bool = False,
+    preserve_peak: bool = False,
+    pos_dist_thresh: float = 17.0,
 ) -> dict:
     """
     Apply skeletal-aware masking to target heatmaps using GT landmark distances.
@@ -351,9 +464,11 @@ def apply_skeletal_target_masking_simple(
                 if gt_limb_length < 1.0:  # minimum 1 pixel distance
                     continue
 
-                # Convert adjacent landmark to heatmap coordinates using stride
-                heatmap_x = adj_x / stride
-                heatmap_y = adj_y / stride
+                # Convert adjacent landmark to heatmap coordinates using stride.
+                # half_cell_fix: measure to cell CENTRES (matches Gaussian frame).
+                half_cell = 0.5 if half_cell_fix else 0.0
+                heatmap_x = adj_x / stride - half_cell
+                heatmap_y = adj_y / stride - half_cell
 
                 # Calculate radius in heatmap coordinates using GT limb length
                 radius = gt_limb_length / stride * skeletal_radius_multiplier
@@ -396,6 +511,23 @@ def apply_skeletal_target_masking_simple(
                     alpha = union_intersect_adjacent_skeletal_mask_alpha
                     mask = (1.0 - alpha) * union_mask + alpha * intersection_mask
 
+                # Guarantee the joint's own peak + positive disk always survives
+                # (limb is known-visible here; see visibility check above).
+                if preserve_peak:
+                    # Disk centred in the cell-CENTRE frame (always -0.5) so it
+                    # always covers the Gaussian's argmax cell, regardless of
+                    # half_cell_fix.
+                    yy_p, xx_p = torch.meshgrid(
+                        torch.arange(height, device=device),
+                        torch.arange(width, device=device),
+                        indexing='ij'
+                    )
+                    pcx = limb_x / stride - 0.5
+                    pcy = limb_y / stride - 0.5
+                    peak_disk = (torch.sqrt((xx_p - pcx) ** 2 + (yy_p - pcy) ** 2)
+                                 <= (pos_dist_thresh / stride)).float()
+                    mask = torch.maximum(mask, peak_disk)
+
                 # Multiply target heatmap by mask
                 heatmap_targets[batch_idx, :, :, limb_idx] *= mask
             # If no mask was applied, leave target unchanged (equivalent to mask of all 1's)
@@ -412,6 +544,7 @@ def compute_skeletal_constraint_loss(
     radius_multiplier: float = 1.0,
     body_length_error_mean: float = 0.0,
     body_length_error_std: float = 0.05,
+    svl_landmarks: tuple[str, str] = DEFAULT_SVL_LANDMARKS,
 ) -> torch.Tensor:
     """
     Compute skeletal constraint loss based on expected limb lengths.
@@ -426,6 +559,9 @@ def compute_skeletal_constraint_loss(
         radius_multiplier: Multiplier for the skeletal radius
         body_length_error_mean: Mean of the random error distribution for corrupting body lengths
         body_length_error_std: Std of the random error distribution for corrupting body lengths
+        svl_landmarks: Landmark pair used as the snout-vent length proxy, both
+            for the predicted normalization distance and for locating the
+            reference SVL length inside ``skeletal_data['links']``
 
     Returns:
         Skeletal constraint loss tensor
@@ -446,15 +582,20 @@ def compute_skeletal_constraint_loss(
             device=device
         )
     else:
-        error_multipliers = torch.ones(batch_size, device=device) * (1.0 + body_length_error_mean)
+        error_multipliers = torch.ones(batch_size, device=device)
 
-    # Get indices for snout and tail1 for normalization
+    # Get indices for the SVL landmark pair used for normalization
     try:
-        snout_idx = bodyparts.index('snout')
-        tail1_idx = bodyparts.index('tail1')
+        snout_idx = bodyparts.index(svl_landmarks[0])
+        tail1_idx = bodyparts.index(svl_landmarks[1])
     except ValueError:
-        # If snout or tail1 not in bodyparts, return zero loss
+        # If either SVL landmark is not in bodyparts, return zero loss
         return torch.tensor(0.0, device=device, requires_grad=True)
+
+    # Links of the first sample whose reference set did not contain the SVL pair.
+    # Without that reference every constraint in the sample is skipped and the
+    # loss is silently 0.0, so it is reported (once) after the loop.
+    links_missing_svl_ref = None
 
     for batch_idx in range(batch_size):
         # Get skeletal data for this sample
@@ -487,7 +628,7 @@ def compute_skeletal_constraint_loss(
         # Get keypoints for this sample (assuming single animal for now)
         kpts = predicted_keypoints[batch_idx, 0]  # Shape: (num_joints, 3)
 
-        # Check if snout and tail1 are visible and valid for normalization
+        # Check both SVL landmarks are visible and valid for normalization
         snout_vis = kpts[snout_idx, 2] > 0.5  # visibility threshold
         tail1_vis = kpts[tail1_idx, 2] > 0.5
 
@@ -571,6 +712,8 @@ def compute_skeletal_constraint_loss(
                 normalized_expected = expected_length / corrupted_svl_length
             else:
                 # If we can't find expected SVL, skip this constraint
+                if links_missing_svl_ref is None:
+                    links_missing_svl_ref = links
                 continue
 
             # Compute constraint loss: 0 if pred <= expected, (pred - expected)^2 if pred > expected
@@ -582,6 +725,13 @@ def compute_skeletal_constraint_loss(
             # Stack and average the losses to avoid in-place operations
             sample_loss = torch.stack(link_losses).mean()
             sample_losses.append(sample_loss)
+
+    if links_missing_svl_ref is not None:
+        _warn_missing_svl_reference(
+            _link_pairs_as_names(links_missing_svl_ref, bodyparts),
+            tuple(svl_landmarks),
+            "Limb-length loss (ground-truth SVL)",
+        )
 
     if len(sample_losses) > 0:
         # Stack and average all sample losses to avoid in-place operations
@@ -600,14 +750,15 @@ def compute_skeletal_constraint_loss_predicted_svl(
     loss_weight: float = 1.0,
     radius_multiplier: float = 1.0,
     svl_confidence_threshold: float = 0.5,
-    svl_min_length: float = 10.0
+    svl_min_length: float = 10.0,
+    svl_landmarks: tuple[str, str] = DEFAULT_SVL_LANDMARKS,
 ) -> torch.Tensor:
     """
     Compute skeletal constraint loss using predicted body length (SVL) for normalization.
 
-    This version uses the predicted snout-to-tail1 distance for scaling instead of
-    ground truth body length. If the confidence of either snout or tail1 is below
-    the threshold, no loss is computed for that image.
+    This version uses the predicted distance between the two SVL landmarks for
+    scaling instead of ground truth body length. If the confidence of either SVL
+    landmark is below the threshold, no loss is computed for that image.
 
     Args:
         predicted_keypoints: Tensor of shape (batch_size, num_animals, num_joints, 3)
@@ -617,8 +768,9 @@ def compute_skeletal_constraint_loss_predicted_svl(
         device: Device to put tensors on
         loss_weight: Weight for the skeletal loss
         radius_multiplier: Multiplier for the skeletal radius
-        svl_confidence_threshold: Confidence threshold for snout and tail1 landmarks
+        svl_confidence_threshold: Confidence threshold for the SVL landmarks
                                   to compute loss (default: 0.5)
+        svl_landmarks: Landmark pair used as the snout-vent length proxy
 
     Returns:
         Skeletal constraint loss tensor
@@ -629,13 +781,18 @@ def compute_skeletal_constraint_loss_predicted_svl(
     batch_size = predicted_keypoints.shape[0]
     sample_losses = []
 
-    # Get indices for snout and tail1 for normalization
+    # Get indices for the SVL landmark pair used for normalization
     try:
-        snout_idx = bodyparts.index('snout')
-        tail1_idx = bodyparts.index('tail1')
+        snout_idx = bodyparts.index(svl_landmarks[0])
+        tail1_idx = bodyparts.index(svl_landmarks[1])
     except ValueError:
-        # If snout or tail1 not in bodyparts, return zero loss
+        # If either SVL landmark is not in bodyparts, return zero loss
         return torch.tensor(0.0, device=device, requires_grad=True)
+
+    # Links of the first sample whose reference set did not contain the SVL pair;
+    # such a sample is skipped entirely, so the loss is silently 0.0. Reported
+    # (once) after the loop.
+    links_missing_svl_ref = None
 
     for batch_idx in range(batch_size):
         # Get skeletal data for this sample
@@ -706,6 +863,8 @@ def compute_skeletal_constraint_loss_predicted_svl(
 
         if expected_svl_length is None or expected_svl_length <= 0:
             # Cannot find expected SVL, skip this sample
+            if links_missing_svl_ref is None:
+                links_missing_svl_ref = links
             continue
 
         link_losses = []
@@ -770,6 +929,13 @@ def compute_skeletal_constraint_loss_predicted_svl(
             sample_loss = torch.stack(link_losses).mean()
             sample_losses.append(sample_loss)
 
+    if links_missing_svl_ref is not None:
+        _warn_missing_svl_reference(
+            _link_pairs_as_names(links_missing_svl_ref, bodyparts),
+            tuple(svl_landmarks),
+            "Limb-length loss (predicted SVL)",
+        )
+
     if len(sample_losses) > 0:
         # Stack and average all sample losses to avoid in-place operations
         total_loss = torch.stack(sample_losses).mean() * loss_weight
@@ -786,14 +952,18 @@ def compute_skeletal_constraint_loss2(
     device: torch.device,
     loss_weight: float = 1.0,
     radius_multiplier: float = 1.0,
+    svl_landmarks: tuple[str, str] = DEFAULT_SVL_LANDMARKS,
 ) -> torch.Tensor:
+    # NOTE: this variant is currently unreferenced -- the runner dispatches only
+    # to compute_skeletal_constraint_loss / ..._predicted_svl. It takes
+    # svl_landmarks anyway so it does not become a trap if it is ever wired up.
     if not skeletal_data or len(skeletal_data.get('links', [])) == 0:
         return torch.zeros((), device=device)
 
     # required indices
     try:
-        snout_idx = bodyparts.index('snout')
-        tail1_idx = bodyparts.index('tail1')
+        snout_idx = bodyparts.index(svl_landmarks[0])
+        tail1_idx = bodyparts.index(svl_landmarks[1])
     except ValueError:
         return torch.zeros((), device=device)
 
@@ -982,6 +1152,75 @@ class TrainingRunner(Runner, Generic[ModelType], metaclass=ABCMeta):
 
         return state_dict_
 
+    def _check_svl_reference_available(self, train_loader) -> None:
+        """Fail before epoch 1 if the configured SVL pair has no reference length.
+
+        Both skeletal mechanisms look the reference up by ``self.svl_landmarks``:
+        the mm->pixel scale that sizes THT's X-ray-derived radii, and the
+        normaliser in the limb-length losses. If the dataset attached the 'svl'
+        trait to a *different* pair, neither errors -- THT silently falls back to
+        ground-truth distances and LLL returns exactly 0.0 for every batch. The
+        run then completes normally and writes an ``override__svl_landmarks``
+        column into cv_results_*.csv naming a mechanism that never ran, which is
+        indistinguishable from a converged constraint in learning_stats.csv.
+
+        This is the one place that can tell the two sides apart, because it sees
+        the pairs the dataset actually emitted.
+        """
+        # Unwrap Subset/wrapper datasets to reach the SkeletalPoseDataset.
+        dataset = getattr(train_loader, "dataset", None)
+        for _ in range(4):
+            if dataset is None or hasattr(dataset, "skeleton_dict"):
+                break
+            dataset = getattr(dataset, "dataset", None)
+        skeleton_dict = getattr(dataset, "skeleton_dict", None)
+        if not skeleton_dict:
+            return  # no skeletal data -> no SVL reference is needed
+
+        bodyparts = (self.model_cfg.get("metadata") or {}).get("bodyparts")
+        if not bodyparts:
+            return  # step() also skips the skeletal paths without bodyparts
+
+        pair = tuple(self.svl_landmarks)
+        if pair[0] not in bodyparts or pair[1] not in bodyparts:
+            # Pre-existing graceful no-op: the pair is not expressible in this
+            # project, so every skeletal path already degrades to a no-op.
+            return
+
+        want = (bodyparts.index(pair[0]), bodyparts.index(pair[1]))
+        want_reversed = (want[1], want[0])
+        n_with_reference = 0
+        emitted = set()
+        for entry in skeleton_dict.values():
+            links = set()
+            for link in entry.get("links", []):
+                try:
+                    links.add((int(link[0]), int(link[1])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+            emitted |= links
+            if want in links or want_reversed in links:
+                n_with_reference += 1
+
+        if n_with_reference > 0:
+            logging.info(
+                f"Skeletal constraints: SVL landmark pair {pair} has a reference "
+                f"length for {n_with_reference}/{len(skeleton_dict)} subjects."
+            )
+            return
+
+        raise ValueError(
+            f"The configured SVL landmark pair {pair} ('svl_landmarks' in the "
+            f"model config) has no reference length for any of the "
+            f"{len(skeleton_dict)} subjects in the skeletal dataset. The pairs "
+            f"the dataset actually emitted are "
+            f"{sorted(_link_pairs_as_names(emitted, bodyparts))}. Target "
+            f"truncation would silently fall back to ground-truth distances and "
+            f"the limb-length loss would be exactly 0.0 for every batch, so this "
+            f"run would report a mechanism that never ran. Make 'svl_landmarks' "
+            f"match the pair create_skeleton_dictionary emitted."
+        )
+
     @abstractmethod
     def step(
         self, batch: dict[str, Any], mode: str = "train"
@@ -1072,6 +1311,27 @@ class TrainingRunner(Runner, Generic[ModelType], metaclass=ABCMeta):
         if "truncate_targets" in self.model_cfg:
             self.truncate_targets = self.model_cfg["truncate_targets"]
 
+        # THT target-masking fixes (default off -> reproduces prior runs exactly):
+        #  - half_cell_fix: build the truncation circle in the cell-CENTRE frame
+        #    (matches the Gaussian target), removing the ~half-cell displacement.
+        #  - preserve_peak: OR-in the joint's own positive disk so THT can never
+        #    zero the true-joint peak pixel.
+        self.skeletal_mask_half_cell_fix = False
+        if "skeletal_mask_half_cell_fix" in self.model_cfg:
+            self.skeletal_mask_half_cell_fix = self.model_cfg["skeletal_mask_half_cell_fix"]
+
+        self.skeletal_mask_preserve_peak = False
+        if "skeletal_mask_preserve_peak" in self.model_cfg:
+            self.skeletal_mask_preserve_peak = self.model_cfg["skeletal_mask_preserve_peak"]
+
+        self.skeletal_mask_pos_dist_thresh = 17.0
+        try:
+            self.skeletal_mask_pos_dist_thresh = float(
+                self.model_cfg["model"]["heads"]["bodypart"]["target_generator"]["pos_dist_thresh"]
+            )
+        except (KeyError, TypeError):
+            pass
+
         # Body length error injection config (for corrupting ground truth body lengths)
         self.body_length_error_mean = 0.0
         if "body_length_error_mean" in self.model_cfg:
@@ -1092,6 +1352,18 @@ class TrainingRunner(Runner, Generic[ModelType], metaclass=ABCMeta):
         self.skeletal_loss_svl_confidence_threshold = 0.5
         if "skeletal_loss_svl_confidence_threshold" in self.model_cfg:
             self.skeletal_loss_svl_confidence_threshold = self.model_cfg["skeletal_loss_svl_confidence_threshold"]
+
+        # Landmark pair standing in for snout-vent length. Read through the same
+        # resolver the data side uses (see data/base.py), off the same model
+        # config key, so the reference length emitted by
+        # create_skeleton_dictionary and the lookups here cannot disagree.
+        # Default ('snout', 'tail1') reproduces all prior runs; the CSV 'svl'
+        # trait is really snout-to-vent, for which ('snout', 'spine6') is a much
+        # closer proxy (tail1 sits ~17% further back).
+        self.svl_landmarks = resolve_svl_landmarks(
+            self.model_cfg, (self.model_cfg.get("metadata") or {}).get("bodyparts")
+        )
+        self._check_svl_reference_available(train_loader)
 
         self.union_intersect_adjacent_skeletal_mask_alpha = self.union_intersect_adjacent_skeletal_mask_alpha_start
         self.skeletal_radius_multiplier = self.skeletal_radius_multiplier_start
@@ -1396,7 +1668,11 @@ class PoseTrainingRunner(TrainingRunner[PoseModel]):
                         device=self.device,
                         stride=stride,
                         skeletal_radius_multiplier=skeleletal_radius_multiplier,
-                        union_intersect_adjacent_skeletal_mask_alpha=union_intersect_adjacent_skeletal_mask_alpha
+                        union_intersect_adjacent_skeletal_mask_alpha=union_intersect_adjacent_skeletal_mask_alpha,
+                        half_cell_fix=self.skeletal_mask_half_cell_fix,
+                        preserve_peak=self.skeletal_mask_preserve_peak,
+                        pos_dist_thresh=self.skeletal_mask_pos_dist_thresh,
+                        svl_landmarks=self.svl_landmarks,
                     )
                 else:
                     target = apply_skeletal_target_masking_simple(
@@ -1406,7 +1682,10 @@ class PoseTrainingRunner(TrainingRunner[PoseModel]):
                         device=self.device,
                         stride=stride,
                         skeletal_radius_multiplier=skeleletal_radius_multiplier,
-                        union_intersect_adjacent_skeletal_mask_alpha=union_intersect_adjacent_skeletal_mask_alpha
+                        union_intersect_adjacent_skeletal_mask_alpha=union_intersect_adjacent_skeletal_mask_alpha,
+                        half_cell_fix=self.skeletal_mask_half_cell_fix,
+                        preserve_peak=self.skeletal_mask_preserve_peak,
+                        pos_dist_thresh=self.skeletal_mask_pos_dist_thresh,
                     )
 
         losses_dict = underlying_model.get_loss(outputs, target)
@@ -1447,7 +1726,8 @@ class PoseTrainingRunner(TrainingRunner[PoseModel]):
                             device=self.device,
                             loss_weight=skeletal_loss_weight,
                             radius_multiplier=self.skeletal_loss_radius_multiplier,
-                            svl_confidence_threshold=self.skeletal_loss_svl_confidence_threshold
+                            svl_confidence_threshold=self.skeletal_loss_svl_confidence_threshold,
+                            svl_landmarks=self.svl_landmarks,
                         )
                     else:
                         # Default: use ground truth body length (with optional error injection)
@@ -1459,12 +1739,18 @@ class PoseTrainingRunner(TrainingRunner[PoseModel]):
                             loss_weight=skeletal_loss_weight,
                             radius_multiplier=self.skeletal_loss_radius_multiplier,
                             body_length_error_mean=self.body_length_error_mean,
-                            body_length_error_std=self.body_length_error_std
+                            body_length_error_std=self.body_length_error_std,
+                            svl_landmarks=self.svl_landmarks,
                         )
 
                     losses_dict["skeletal_loss"] = skeletal_loss
                     # Create a new tensor to avoid in-place operations
                     losses_dict["total_loss"] = losses_dict["total_loss"] + skeletal_loss
+
+        # Ensure skeletal_loss is always present in the losses dict so the column
+        # always appears in learning_stats.csv (zero when not applicable).
+        if "skeletal_loss" not in losses_dict:
+            losses_dict["skeletal_loss"] = torch.tensor(0.0, device=self.device)
 
         if mode == "train":
             losses_dict["total_loss"].backward()

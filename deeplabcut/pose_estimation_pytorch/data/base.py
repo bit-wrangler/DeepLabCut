@@ -28,6 +28,10 @@ from deeplabcut.pose_estimation_pytorch.data.generative_sampling import (
     GenSamplingConfig,
 )
 from deeplabcut.pose_estimation_pytorch.data.snapshots import list_snapshots, Snapshot
+from deeplabcut.pose_estimation_pytorch.skeletal_config import (
+    SVL_LANDMARKS_KEY,
+    resolve_svl_landmarks,
+)
 from deeplabcut.pose_estimation_pytorch.data.utils import (
     _compute_crop_bounds,
     bbox_from_keypoints,
@@ -265,7 +269,32 @@ class Loader(ABC):
         if hasattr(self, '_project_config') and self._project_config.get('lizard_skeletal_data_path'):
             skeletal_csv_path = self._project_config['lizard_skeletal_data_path']
             if Path(skeletal_csv_path).exists():
-                skeleton_dict = create_skeleton_dictionary(self._project_config, skeletal_csv_path)
+                # 'svl_landmarks' lives in the *model* config (pytorch_config.yaml)
+                # so it is settable through run_cv.py's train_overrides and lands
+                # in the override__* columns of cv_results_*.csv. Its only sibling
+                # knob, 'lizard_skeletal_data_path', lives in the project config,
+                # so putting it there is an easy mistake -- and a silent one,
+                # since both sides would then resolve to the default and no
+                # override column would record the request.
+                if SVL_LANDMARKS_KEY in self._project_config:
+                    raise ValueError(
+                        f"'{SVL_LANDMARKS_KEY}' was found in the project config "
+                        f"(config.yaml), where it has no effect. It belongs in the "
+                        f"model config (pytorch_config.yaml), or in run_cv.py's "
+                        f"train_overrides, so that the value is also recorded in "
+                        f"the override__{SVL_LANDMARKS_KEY} column of "
+                        f"cv_results_*.csv."
+                    )
+                # Read the SVL landmark pair from the *model* config (the same
+                # key the training runner reads) and pass it in explicitly, so
+                # the reference length emitted here and the lookup done in
+                # runners/train.py can never disagree.
+                svl_landmarks = resolve_svl_landmarks(
+                    self.model_cfg, self._project_config.get('bodyparts')
+                )
+                skeleton_dict = create_skeleton_dictionary(
+                    self._project_config, skeletal_csv_path, svl_landmarks
+                )
             else:
                 print(f"Warning: Skeletal data path {skeletal_csv_path} does not exist. Proceeding without skeletal data.")
 
